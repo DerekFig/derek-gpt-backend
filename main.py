@@ -1,4 +1,7 @@
 # main.py
+
+# CORS settings updated for localhost frontend
+
 import io
 import json
 import os
