@@ -7,6 +7,13 @@ import json
 import os
 from uuid import UUID
 from typing import Optional, List
+from pdf2image import convert_from_path
+from PIL import Image
+from openai import OpenAI
+
+import base64
+from io import BytesIO
+
 
 from fastapi import (
     FastAPI,
@@ -54,6 +61,81 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# --------------------------------------------------------
+# --- OCR HELPERS USING OPENAI VISION ---
+# --------------------------------------------------------
+
+vision_client = OpenAI()  # uses OPENAI_API_KEY from env
+
+
+def _image_to_base64(image: Image.Image) -> str:
+    """Convert a PIL Image to a base64-encoded PNG string."""
+    buf = BytesIO()
+    image.save(buf, format="PNG")
+    return base64.b64encode(buf.getvalue()).decode("utf-8")
+
+
+def ocr_pages_with_openai(page_images):
+    """
+    Given a list of PIL Images (one per PDF page),
+    call OpenAI Vision to extract ALL visible text from each page.
+    Returns a single big string.
+    """
+    ocr_chunks = []
+
+    for idx, img in enumerate(page_images):
+        b64 = _image_to_base64(img)
+
+        resp = vision_client.chat.completions.create(
+            model="gpt-4.1-mini",  # or "gpt-4.1" if you prefer
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": (
+                                "Extract ALL text visible on this slide/page. "
+                                "Return plain text only, no commentary."
+                            ),
+                        },
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/png;base64,{b64}"
+                            },
+                        },
+                    ],
+                }
+            ],
+            max_tokens=800,
+        )
+
+        text = (resp.choices[0].message.content or "").strip()
+        if text:
+            ocr_chunks.append(f"[PAGE {idx+1} OCR]\n{text}")
+
+    return "\n\n".join(ocr_chunks)
+
+
+def extract_text_from_pdf_with_ocr(file_path: str) -> str:
+    """
+    Render each page of the PDF to an image and run OCR using OpenAI Vision.
+    This does NOT rely on any existing text extractor; it just uses Vision.
+    """
+    try:
+        # Convert all pages of the PDF to images
+        page_images = convert_from_path(file_path, dpi=200)
+    except Exception as e:
+        print(f"PDF to image conversion failed: {e}")
+        return ""
+
+    if not page_images:
+        return ""
+
+    # Run OCR with OpenAI Vision on each page
+    ocr_text = ocr_pages_with_openai(page_images)
+    return ocr_text
 
 # --------------------------------------------------------
 # Admin reset config
@@ -856,9 +938,29 @@ def upload_file(
     results = []
 
     for f in file:
-        text_content = extract_text_from_upload(f)
+        filename_lower = (f.filename or "").lower()
 
-        if not text_content.strip():
+        # Default: use your existing extraction
+        text_content = None
+
+        if filename_lower.endswith(".pdf"):
+            # Read bytes for OCR
+            file_bytes = f.file.read()
+            # Reset pointer so other functions can still read if needed
+            f.file.seek(0)
+
+            ocr_text = extract_text_from_pdf_bytes_with_ocr(file_bytes)
+
+            if ocr_text and ocr_text.strip():
+                text_content = ocr_text
+            else:
+                # Fallback to existing extraction if OCR fails
+                text_content = extract_text_from_upload(f)
+        else:
+            # Non-PDF files use existing extraction logic
+            text_content = extract_text_from_upload(f)
+
+        if not text_content or not text_content.strip():
             continue
 
         ingest_result = ingest_document_text(
