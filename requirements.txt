@@ -7,3 +7,4 @@ pydantic
 openai
 pypdf
 python-docx
+python-multipart
