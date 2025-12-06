@@ -89,7 +89,9 @@ def ocr_pages_with_openai(page_images):
         b64 = _image_to_base64(img)
 
         resp = vision_client.chat.completions.create(
-            model="gpt-4.1-mini",  # or "gpt-4.1" if you prefer
+            model="gpt-4.1",          # use full 4.1 for higher OCR accuracy
+            temperature=0,            # deterministic, no creativity
+            max_tokens=1200,          # a bit more room for dense slides
             messages=[
                 {
                     "role": "user",
@@ -97,8 +99,12 @@ def ocr_pages_with_openai(page_images):
                         {
                             "type": "text",
                             "text": (
-                                "Extract ALL text visible on this slide/page. "
-                                "Return plain text only, no commentary."
+                                "You are performing OCR on a slide or PDF page.\n"
+                                "Transcribe **every piece of visible text** exactly as written.\n"
+                                "- Include people's names, job titles, company names, and labels.\n"
+                                "- Do NOT summarize, rephrase, or skip small text.\n"
+                                "- Preserve line breaks where reasonable.\n"
+                                "- Output plain text only, no commentary, no bullets added by you."
                             ),
                         },
                         {
@@ -110,7 +116,6 @@ def ocr_pages_with_openai(page_images):
                     ],
                 }
             ],
-            max_tokens=800,
         )
 
         text = (resp.choices[0].message.content or "").strip()
