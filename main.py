@@ -951,12 +951,10 @@ def upload_file(
     if not file or len(file) == 0:
         raise HTTPException(status_code=400, detail="No files uploaded.")
 
-    results = []
+        results = []
 
     for f in file:
         filename_lower = (f.filename or "").lower()
-
-        # Default: use your existing extraction
         text_content = None
 
         if filename_lower.endswith(".pdf"):
@@ -965,13 +963,20 @@ def upload_file(
             # Reset pointer so other functions can still read if needed
             f.file.seek(0)
 
+            # Run OCR
             ocr_text = extract_text_from_pdf_bytes_with_ocr(file_bytes)
+            print("DEBUG: OCR text length for", f.filename, "=", len(ocr_text or ""))
 
-            if ocr_text and ocr_text.strip():
-                text_content = ocr_text
-            else:
-                # Fallback to existing extraction if OCR fails
-                text_content = extract_text_from_upload(f)
+            # For now, do NOT fall back – we want to be sure OCR is working
+            if not ocr_text or not ocr_text.strip():
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"OCR returned no text for PDF {f.filename}",
+                )
+
+            # Add a visible marker so you can see OCR in Sources
+            text_content = "[USING_OCR]\n" + ocr_text
+
         else:
             # Non-PDF files use existing extraction logic
             text_content = extract_text_from_upload(f)
@@ -988,6 +993,7 @@ def upload_file(
             metadata=metadata_dict,
         )
         results.append(ingest_result)
+
 
     if not results:
         raise HTTPException(
