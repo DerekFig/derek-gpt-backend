@@ -195,7 +195,7 @@ class ChatRequest(BaseModel):
     tenant_id: str
     workspace_id: str
     query: str
-    top_k: int = 5
+    top_k: int = 12
     history: Optional[List[ChatMessage]] = None
 
 
@@ -227,7 +227,7 @@ class QueryRequest(BaseModel):
     tenant_id: str
     workspace_id: str
     query: str
-    top_k: int = 5
+    top_k: int = 12
 
 
 class QueryResult(BaseModel):
