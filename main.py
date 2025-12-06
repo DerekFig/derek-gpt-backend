@@ -5,11 +5,13 @@
 import io
 import json
 import os
+import fitz  # PyMuPDF
+from openai import OpenAI
+import base64
+from io import BytesIO
 from uuid import UUID
 from typing import Optional, List
-from pdf2image import convert_from_path
 from PIL import Image
-from openai import OpenAI
 
 import base64
 from io import BytesIO
@@ -118,22 +120,36 @@ def ocr_pages_with_openai(page_images):
     return "\n\n".join(ocr_chunks)
 
 
-def extract_text_from_pdf_with_ocr(file_path: str) -> str:
+def extract_text_from_pdf_bytes_with_ocr(file_bytes: bytes) -> str:
     """
-    Render each page of the PDF to an image and run OCR using OpenAI Vision.
-    This does NOT rely on any existing text extractor; it just uses Vision.
+    Use PyMuPDF to render each page of the PDF (from bytes) to an image,
+    then run OCR using OpenAI Vision on each page.
+    Returns all OCR text as one string.
     """
     try:
-        # Convert all pages of the PDF to images
-        page_images = convert_from_path(file_path, dpi=200)
+        # Open the PDF from bytes using PyMuPDF
+        doc = fitz.open(stream=file_bytes, filetype="pdf")
     except Exception as e:
-        print(f"PDF to image conversion failed: {e}")
+        print(f"PyMuPDF failed to open PDF: {e}")
+        return ""
+
+    page_images = []
+    try:
+        for page_index in range(len(doc)):
+            page = doc[page_index]
+            # Render the page to a pixmap (image)
+            pix = page.get_pixmap(dpi=200)
+            # Convert pixmap to PIL Image
+            img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+            page_images.append(img)
+    except Exception as e:
+        print(f"Error rendering PDF pages to images: {e}")
         return ""
 
     if not page_images:
         return ""
 
-    # Run OCR with OpenAI Vision on each page
+    # Run OCR with OpenAI Vision on the rendered page images
     ocr_text = ocr_pages_with_openai(page_images)
     return ocr_text
 

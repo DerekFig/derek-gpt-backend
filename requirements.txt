@@ -9,5 +9,6 @@ pypdf
 python-docx
 python-multipart
 Pillow
-pdf2image
+pymupdf
+
 
