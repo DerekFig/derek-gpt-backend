@@ -47,8 +47,7 @@ app.add_middleware(
     allow_origins=[
         "http://localhost:3000",
         "http://127.0.0.1:3000",
-        # add your deployed frontend origin later, e.g.
-        # "https://derek-gpt-frontend.vercel.app",
+        "https://derek-gpt-frontend.vercel.app",
     ],
     allow_credentials=True,
     allow_methods=["*"],
