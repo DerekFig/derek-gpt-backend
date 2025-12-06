@@ -941,6 +941,7 @@ def upload_file(
     - We extract text for each
     - Then call the same ingestion pipeline
     """
+    # ---- Parse metadata JSON (unchanged) ----
     metadata_dict = None
     if metadata:
         try:
@@ -951,13 +952,13 @@ def upload_file(
     if not file or len(file) == 0:
         raise HTTPException(status_code=400, detail="No files uploaded.")
 
-        results = []
+    # IMPORTANT: define results once, before the loop
+    results: list = []
 
-        results = []  # make sure this is BEFORE the loop
-
+    # ---- Handle each uploaded file ----
     for f in file:
         filename_lower = (f.filename or "").lower()
-        text_content = None
+        text_content: Optional[str] = None
 
         if filename_lower.endswith(".pdf"):
             # Read bytes for OCR
@@ -969,11 +970,11 @@ def upload_file(
             ocr_text = extract_text_from_pdf_bytes_with_ocr(file_bytes)
             print("DEBUG: OCR text length for", f.filename, "=", len(ocr_text or ""))
 
-            # If OCR returned something, use it
             if ocr_text and ocr_text.strip():
+                # Add visible marker so you can confirm OCR in Sources
                 text_content = "[USING_OCR]\n" + ocr_text
             else:
-                # Fallback to your existing extraction if OCR fails
+                # Fallback to your existing extraction if OCR somehow fails
                 text_content = extract_text_from_upload(f)
         else:
             # Non-PDF files use existing extraction logic
@@ -983,6 +984,7 @@ def upload_file(
         if not text_content or not text_content.strip():
             continue
 
+        # Call your existing ingestion pipeline
         ingest_result = ingest_document_text(
             db=db,
             tenant_id=tenant_id,
