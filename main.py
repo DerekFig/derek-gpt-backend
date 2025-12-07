@@ -16,7 +16,6 @@ from PIL import Image
 import base64
 from io import BytesIO
 
-
 from fastapi import (
     FastAPI,
     Depends,
@@ -27,9 +26,10 @@ from fastapi import (
     Header,
     Query,
     status,
+    Request,
 )
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, JSONResponse
 
 from pydantic import BaseModel
 
@@ -62,6 +62,56 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# --------------------------------------------------------
+# Global middleware to enforce INTERNAL_BACKEND_KEY
+# --------------------------------------------------------
+
+@app.middleware("http")
+async def enforce_internal_key(request: Request, call_next):
+    path = request.url.path
+
+    # Public endpoints (no key required)
+    public_paths = {
+        "/health",
+        "/whoami",
+    }
+
+    # Any path starting with these prefixes is protected
+    protected_prefixes = (
+        "/chat",
+        "/chat-stream",
+        "/upload-file",
+        "/query",
+        "/documents",
+        "/tenants",
+        "/workspaces",
+        "/debug",
+        "/admin",
+    )
+
+    # If it's not explicitly public AND matches a protected prefix, require key
+    if path not in public_paths and any(
+        path == prefix or path.startswith(prefix + "/")
+        for prefix in protected_prefixes
+    ):
+        header_key = request.headers.get("x-internal-key")
+
+        if INTERNAL_BACKEND_KEY is None:
+            return JSONResponse(
+                status_code=500,
+                content={"detail": "Internal key not configured"},
+            )
+
+        if header_key != INTERNAL_BACKEND_KEY:
+            return JSONResponse(
+                status_code=401,
+                content={"detail": "Unauthorized: invalid or missing X-Internal-Key"},
+            )
+
+    # Otherwise continue normally
+    response = await call_next(request)
+    return response
 
 # --------------------------------------------------------
 # --- OCR HELPERS USING OPENAI VISION ---
