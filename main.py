@@ -1236,3 +1236,7 @@ def update_workspace(
         raise HTTPException(status_code=404, detail="Workspace not found")
 
     return {"status": "ok", "workspace_id": str(row.id)}
+
+@app.get("/whoami")
+def whoami():
+    return {"running_file": "MAIN_PY_IS_RUNNING"}
