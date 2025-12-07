@@ -1,20 +1,15 @@
 # main.py
 
-# CORS settings updated for localhost frontend
-
 import io
 import json
 import os
-import fitz  # PyMuPDF
-from openai import OpenAI
-import base64
-from io import BytesIO
 from uuid import UUID
 from typing import Optional, List
-from PIL import Image
 
-import base64
-from io import BytesIO
+import fitz  # PyMuPDF
+from PIL import Image
+from pypdf import PdfReader
+from docx import Document as DocxDocument
 
 from fastapi import (
     FastAPI,
@@ -26,10 +21,9 @@ from fastapi import (
     Header,
     Query,
     status,
-    Request,
 )
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse, JSONResponse
+from fastapi.responses import StreamingResponse
 
 from pydantic import BaseModel
 
@@ -40,9 +34,48 @@ from openai import OpenAI, RateLimitError
 
 from db import get_db
 
-# For extracting text from files
-from pypdf import PdfReader
-from docx import Document as DocxDocument
+import base64
+from io import BytesIO
+
+
+# --------------------------------------------------------
+# Environment-backed keys
+# --------------------------------------------------------
+
+INTERNAL_BACKEND_KEY = os.getenv("INTERNAL_BACKEND_KEY")
+
+
+def verify_internal_key(x_internal_key: str = Header(None)):
+    """
+    Require X-Internal-Key for protected endpoints.
+    """
+    if INTERNAL_BACKEND_KEY is None:
+        raise HTTPException(
+            status_code=500,
+            detail="Internal key not configured",
+        )
+
+    if x_internal_key != INTERNAL_BACKEND_KEY:
+        raise HTTPException(
+            status_code=401,
+            detail="Unauthorized: invalid or missing X-Internal-Key",
+        )
+
+
+# --------------------------------------------------------
+# Admin API key + guard
+# --------------------------------------------------------
+
+ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "changeme-reset-key")
+
+
+def verify_admin(x_admin_api_key: str = Header(None)):
+    """
+    Simple admin guard for /admin endpoints.
+    Callers must send X-Admin-Api-Key header that matches ADMIN_API_KEY.
+    """
+    if x_admin_api_key != ADMIN_API_KEY:
+        raise HTTPException(status_code=403, detail="Forbidden")
 
 
 # --------------------------------------------------------
@@ -63,65 +96,15 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --------------------------------------------------------
-# Global middleware to enforce INTERNAL_BACKEND_KEY
-# --------------------------------------------------------
-
-@app.middleware("http")
-async def enforce_internal_key(request: Request, call_next):
-    path = request.url.path
-
-    # Public endpoints (no key required)
-    public_paths = {
-        "/health",
-        "/whoami",
-    }
-
-    # Any path starting with these prefixes is protected
-    protected_prefixes = (
-        "/chat",
-        "/chat-stream",
-        "/upload-file",
-        "/query",
-        "/documents",
-        "/tenants",
-        "/workspaces",
-        "/debug",
-        "/admin",
-    )
-
-    # If it's not explicitly public AND matches a protected prefix, require key
-    if path not in public_paths and any(
-        path == prefix or path.startswith(prefix + "/")
-        for prefix in protected_prefixes
-    ):
-        header_key = request.headers.get("x-internal-key")
-
-        if INTERNAL_BACKEND_KEY is None:
-            return JSONResponse(
-                status_code=500,
-                content={"detail": "Internal key not configured"},
-            )
-
-        if header_key != INTERNAL_BACKEND_KEY:
-            return JSONResponse(
-                status_code=401,
-                content={"detail": "Unauthorized: invalid or missing X-Internal-Key"},
-            )
-
-    # Otherwise continue normally
-    response = await call_next(request)
-    return response
 
 # --------------------------------------------------------
-# --- OCR HELPERS USING OPENAI VISION ---
+# OCR HELPERS USING OPENAI VISION
 # --------------------------------------------------------
 
 vision_client = OpenAI()  # uses OPENAI_API_KEY from env
 
 
 def _image_to_base64(image: Image.Image) -> str:
-    """Convert a PIL Image to a base64-encoded PNG string."""
     buf = BytesIO()
     image.save(buf, format="PNG")
     return base64.b64encode(buf.getvalue()).decode("utf-8")
@@ -139,9 +122,9 @@ def ocr_pages_with_openai(page_images):
         b64 = _image_to_base64(img)
 
         resp = vision_client.chat.completions.create(
-            model="gpt-4.1",          # use full 4.1 for higher OCR accuracy
-            temperature=0,            # deterministic, no creativity
-            max_tokens=1200,          # a bit more room for dense slides
+            model="gpt-4.1",
+            temperature=0,
+            max_tokens=1200,
             messages=[
                 {
                     "role": "user",
@@ -182,7 +165,6 @@ def extract_text_from_pdf_bytes_with_ocr(file_bytes: bytes) -> str:
     Returns all OCR text as one string.
     """
     try:
-        # Open the PDF from bytes using PyMuPDF
         doc = fitz.open(stream=file_bytes, filetype="pdf")
     except Exception as e:
         print(f"PyMuPDF failed to open PDF: {e}")
@@ -192,9 +174,7 @@ def extract_text_from_pdf_bytes_with_ocr(file_bytes: bytes) -> str:
     try:
         for page_index in range(len(doc)):
             page = doc[page_index]
-            # Render the page to a pixmap (image)
             pix = page.get_pixmap(dpi=200)
-            # Convert pixmap to PIL Image
             img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
             page_images.append(img)
     except Exception as e:
@@ -204,9 +184,9 @@ def extract_text_from_pdf_bytes_with_ocr(file_bytes: bytes) -> str:
     if not page_images:
         return ""
 
-    # Run OCR with OpenAI Vision on the rendered page images
     ocr_text = ocr_pages_with_openai(page_images)
     return ocr_text
+
 
 # --------------------------------------------------------
 # Admin reset config
@@ -217,24 +197,15 @@ class ResetWorkspaceRequest(BaseModel):
     workspace_id: UUID
 
 
-ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "changeme-reset-key")
-
-
-def verify_admin(x_admin_api_key: str = Header(None)):
-    if x_admin_api_key != ADMIN_API_KEY:
-        raise HTTPException(status_code=403, detail="Forbidden")
-
-
 # --------------------------------------------------------
 # OpenAI + embedding model config
 # --------------------------------------------------------
 
 EMBEDDING_MODEL = "text-embedding-3-large"
-# Must match Supabase: embedding vector(1024)
+# Must match pgvector: vector(1024)
 EMBEDDING_DIM = 1024
 
-# OpenAI client (uses OPENAI_API_KEY from env)
-client = OpenAI()
+client = OpenAI()  # uses OPENAI_API_KEY from env
 
 
 # --------------------------------------------------------
@@ -295,14 +266,10 @@ class QueryResult(BaseModel):
 
 
 # --------------------------------------------------------
-# Helpers
+# Helper functions
 # --------------------------------------------------------
 
 def get_workspace_config(db: Session, workspace_id: str):
-    """
-    Load persona/config for a workspace.
-    Falls back to sane defaults if not set.
-    """
     row = db.execute(
         text("""
             SELECT system_prompt, default_model, temperature
@@ -327,7 +294,6 @@ def get_workspace_config(db: Session, workspace_id: str):
 
 
 def chunk_text(text: str, chunk_size: int = 800, overlap: int = 200) -> List[str]:
-    """Simple sliding-window chunking of long text."""
     chunks: List[str] = []
     start = 0
     n = len(text)
@@ -354,38 +320,27 @@ SOURCE_TYPES = [
 
 
 def classify_source_type(filename: str, content: str) -> str:
-    """
-    Lightweight classifier that combines simple heuristics with an optional
-    LLM call. Returns one of SOURCE_TYPES.
-    """
     lower_name = (filename or "").lower()
 
-    # --- Heuristics first (cheap / fast) ---
-
-    # Deck
+    # Heuristics
     if any(ext in lower_name for ext in [".ppt", ".pptx", " deck", " slides"]):
         return "deck"
 
-    # Transcript / call
     if "transcript" in lower_name or "otter" in lower_name:
         return "transcript"
     if any(word in lower_name for word in ["call", "zoom", "meeting"]):
         return "call"
 
-    # Notes
     if "notes" in lower_name:
         return "notes"
 
-    # Interview
     if "interview" in lower_name:
         return "interview"
 
-    # Email
     if any(ext in lower_name for ext in [".eml", ".msg"]) or "email" in lower_name:
         return "email"
 
-    # --- Optional: short LLM classification if still ambiguous ---
-
+    # Optional LLM classification
     snippet = (content or "")[:2000]
 
     try:
@@ -417,16 +372,10 @@ def classify_source_type(filename: str, content: str) -> str:
     except Exception as e:
         print("WARN: classify_source_type fallback due to error:", repr(e))
 
-    # Fallback
     return "document"
 
 
 def embed_text(text: str) -> list[float]:
-    """
-    Create an embedding for text using the global EMBEDDING_MODEL constant.
-    Uses EMBEDDING_DIM (1024) to match the pgvector column.
-    Handles OpenAI rate limit / quota errors cleanly.
-    """
     try:
         response = client.embeddings.create(
             model=EMBEDDING_MODEL,
@@ -458,22 +407,12 @@ def ingest_document_text(
     content: str,
     metadata: Optional[dict] = None,
 ):
-    """
-    Core ingestion logic:
-    - classify source_type
-    - insert into documents
-    - chunk content
-    - embed each chunk
-    - insert into embeddings
-    """
     metadata = metadata or {}
 
-    # 0) Decide source_type (allow metadata override if present)
     source_type = metadata.get("source_type")
     if not source_type:
         source_type = classify_source_type(original_filename, content)
 
-    # 1) Insert document row
     result = db.execute(
         text("""
             INSERT INTO documents (
@@ -506,10 +445,8 @@ def ingest_document_text(
     doc_row = result.fetchone()
     document_id = doc_row.id
 
-    # 2) Chunk
     chunks = chunk_text(content)
 
-    # 3) For each chunk: embed + insert into embeddings
     for idx, chunk in enumerate(chunks):
         embedding = embed_text(chunk)
 
@@ -540,7 +477,7 @@ def ingest_document_text(
                 "document_id": document_id,
                 "chunk_index": idx,
                 "chunk_text": chunk,
-                "embedding": embedding,
+                "embedding": EMBEDDING_MODEL,
                 "embedding_model": EMBEDDING_MODEL,
             },
         )
@@ -555,7 +492,6 @@ def ingest_document_text(
 
 
 def extract_text_from_upload(file: UploadFile) -> str:
-    """Extract plain text from an uploaded file based on its extension."""
     filename = file.filename or "unnamed"
     lower_name = filename.lower()
 
@@ -591,7 +527,10 @@ def health():
     return {"status": "ok"}
 
 
-@app.post("/admin/reset-workspace")
+@app.post(
+    "/admin/reset-workspace",
+    dependencies=[Depends(verify_internal_key)],
+)
 def reset_workspace(
     payload: ResetWorkspaceRequest,
     db: Session = Depends(get_db),
@@ -651,7 +590,7 @@ def reset_workspace(
     }
 
 
-@app.get("/tenants")
+@app.get("/tenants", dependencies=[Depends(verify_internal_key)])
 def list_tenants(db: Session = Depends(get_db)):
     result = db.execute(
         text("SELECT id, name, type, created_at FROM tenants ORDER BY created_at ASC;")
@@ -669,7 +608,7 @@ def list_tenants(db: Session = Depends(get_db)):
     ]
 
 
-@app.post("/tenants")
+@app.post("/tenants", dependencies=[Depends(verify_internal_key)])
 def create_tenant(tenant: TenantCreate, db: Session = Depends(get_db)):
     stmt = text("""
         INSERT INTO tenants (name, type)
@@ -693,7 +632,7 @@ def create_tenant(tenant: TenantCreate, db: Session = Depends(get_db)):
     }
 
 
-@app.get("/workspaces")
+@app.get("/workspaces", dependencies=[Depends(verify_internal_key)])
 def list_workspaces(tenant_id: str, db: Session = Depends(get_db)):
     stmt = text("""
         SELECT id, tenant_id, name, created_at
@@ -715,7 +654,7 @@ def list_workspaces(tenant_id: str, db: Session = Depends(get_db)):
     ]
 
 
-@app.post("/workspaces")
+@app.post("/workspaces", dependencies=[Depends(verify_internal_key)])
 def create_workspace(payload: WorkspaceCreate, db: Session = Depends(get_db)):
     stmt = text("""
         INSERT INTO workspaces (tenant_id, name)
@@ -742,11 +681,12 @@ def create_workspace(payload: WorkspaceCreate, db: Session = Depends(get_db)):
     }
 
 
-@app.get("/documents")
-def list_documents(tenant_id: str, workspace_id: str, db: Session = Depends(get_db)):
-    """
-    List documents for a given tenant + workspace, including source_type.
-    """
+@app.get("/documents", dependencies=[Depends(verify_internal_key)])
+def list_documents(
+    tenant_id: str,
+    workspace_id: str,
+    db: Session = Depends(get_db),
+):
     sql = text("""
         SELECT
             d.id,
@@ -781,16 +721,17 @@ def list_documents(tenant_id: str, workspace_id: str, db: Session = Depends(get_
     ]
 
 
-@app.delete("/documents/{document_id}", status_code=status.HTTP_204_NO_CONTENT)
+@app.delete(
+    "/documents/{document_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    dependencies=[Depends(verify_internal_key)],
+)
 def delete_document(
     document_id: str,
     tenant_id: str = Query(...),
     workspace_id: str = Query(...),
     db: Session = Depends(get_db),
 ):
-    """
-    Delete a single document and all of its embeddings for a given tenant + workspace.
-    """
     check_sql = text("""
         SELECT id
         FROM documents
@@ -848,7 +789,7 @@ def delete_document(
     return
 
 
-@app.get("/debug/db")
+@app.get("/debug/db", dependencies=[Depends(verify_internal_key)])
 def debug_db(db: Session = Depends(get_db)):
     result = db.execute(text("SELECT current_database(), current_user, current_schema();"))
     db_name, user, schema = result.fetchone()
@@ -867,11 +808,8 @@ def debug_db(db: Session = Depends(get_db)):
     }
 
 
-@app.get("/debug/openai")
+@app.get("/debug/openai", dependencies=[Depends(verify_internal_key)])
 def debug_openai():
-    """
-    Quick health check for OpenAI embeddings.
-    """
     try:
         response = client.embeddings.create(
             model="text-embedding-3-small",
@@ -897,11 +835,11 @@ def debug_openai():
         )
 
 
-@app.post("/query")
-def query_embeddings(payload: QueryRequest, db: Session = Depends(get_db)):
-    """
-    Vector search endpoint for RAG.
-    """
+@app.post("/query", dependencies=[Depends(verify_internal_key)])
+def query_embeddings(
+    payload: QueryRequest,
+    db: Session = Depends(get_db),
+):
     query_embedding = embed_text(payload.query)
 
     sql = text("""
@@ -949,14 +887,11 @@ def query_embeddings(payload: QueryRequest, db: Session = Depends(get_db)):
     }
 
 
-@app.post("/documents")
-def ingest_document(payload: DocumentIn, db: Session = Depends(get_db)):
-    """
-    JSON-based ingestion: caller passes raw text.
-    """
-    print("DEBUG workspace_id repr:", repr(payload.workspace_id))
-    print("DEBUG workspace_id type:", type(payload.workspace_id))
-
+@app.post("/documents", dependencies=[Depends(verify_internal_key)])
+def ingest_document(
+    payload: DocumentIn,
+    db: Session = Depends(get_db),
+):
     ws_sql = text("""
         SELECT id, tenant_id, name
         FROM workspaces
@@ -964,7 +899,6 @@ def ingest_document(payload: DocumentIn, db: Session = Depends(get_db)):
     """)
 
     ws_row = db.execute(ws_sql, {"wid": str(payload.workspace_id)}).fetchone()
-    print("DEBUG workspace row from DB:", ws_row)
 
     if ws_row is None:
         raise HTTPException(
@@ -982,7 +916,7 @@ def ingest_document(payload: DocumentIn, db: Session = Depends(get_db)):
     )
 
 
-@app.post("/upload-file")
+@app.post("/upload-file", dependencies=[Depends(verify_internal_key)])
 def upload_file(
     tenant_id: str = Form(...),
     workspace_id: str = Form(...),
@@ -990,13 +924,6 @@ def upload_file(
     file: List[UploadFile] = File(...),
     db: Session = Depends(get_db),
 ):
-    """
-    File-based ingestion:
-    - Client uploads one or more files
-    - We extract text for each
-    - Then call the same ingestion pipeline
-    """
-    # ---- Parse metadata JSON (unchanged) ----
     metadata_dict = None
     if metadata:
         try:
@@ -1007,39 +934,29 @@ def upload_file(
     if not file or len(file) == 0:
         raise HTTPException(status_code=400, detail="No files uploaded.")
 
-    # IMPORTANT: define results once, before the loop
     results: list = []
 
-    # ---- Handle each uploaded file ----
     for f in file:
         filename_lower = (f.filename or "").lower()
         text_content: Optional[str] = None
 
         if filename_lower.endswith(".pdf"):
-            # Read bytes for OCR
             file_bytes = f.file.read()
-            # Reset pointer so other functions can still read if needed
             f.file.seek(0)
 
-            # Run OCR on the PDF bytes
             ocr_text = extract_text_from_pdf_bytes_with_ocr(file_bytes)
             print("DEBUG: OCR text length for", f.filename, "=", len(ocr_text or ""))
 
             if ocr_text and ocr_text.strip():
-                # Add visible marker so you can confirm OCR in Sources
                 text_content = "[USING_OCR]\n" + ocr_text
             else:
-                # Fallback to your existing extraction if OCR somehow fails
                 text_content = extract_text_from_upload(f)
         else:
-            # Non-PDF files use existing extraction logic
             text_content = extract_text_from_upload(f)
 
-        # Skip if we still have no text
         if not text_content or not text_content.strip():
             continue
 
-        # Call your existing ingestion pipeline
         ingest_result = ingest_document_text(
             db=db,
             tenant_id=tenant_id,
@@ -1059,8 +976,14 @@ def upload_file(
     return {"results": results}
 
 
-@app.post("/chat")
-def chat_with_workspace(payload: ChatRequest, db: Session = Depends(get_db)):
+@app.post(
+    "/chat",
+    dependencies=[Depends(verify_internal_key)],
+)
+def chat_with_workspace(
+    payload: ChatRequest,
+    db: Session = Depends(get_db),
+):
     """
     RAG-style multi-turn chat (non-streaming).
     """
@@ -1154,7 +1077,7 @@ def chat_with_workspace(payload: ChatRequest, db: Session = Depends(get_db)):
     return {"answer": answer, "results": results}
 
 
-@app.post("/chat-stream")
+@app.post("/chat-stream", dependencies=[Depends(verify_internal_key)])
 def chat_with_workspace_stream(
     payload: ChatRequest,
     db: Session = Depends(get_db),
@@ -1248,7 +1171,10 @@ def chat_with_workspace_stream(
     return StreamingResponse(token_stream(), media_type="text/plain")
 
 
-@app.patch("/workspaces/{workspace_id}")
+@app.patch(
+    "/workspaces/{workspace_id}",
+    dependencies=[Depends(verify_internal_key)],
+)
 def update_workspace(
     workspace_id: str,
     payload: WorkspaceUpdate,
@@ -1286,6 +1212,7 @@ def update_workspace(
         raise HTTPException(status_code=404, detail="Workspace not found")
 
     return {"status": "ok", "workspace_id": str(row.id)}
+
 
 @app.get("/whoami")
 def whoami():
