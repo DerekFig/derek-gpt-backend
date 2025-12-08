@@ -448,8 +448,16 @@ def ingest_document_text(
     chunks = chunk_text(content)
 
     for idx, chunk in enumerate(chunks):
+        # 1) Compute the numeric embedding vector for this chunk
         embedding = embed_text(chunk)
 
+        # Optional sanity check: make sure we didn't accidentally get a string
+        if isinstance(embedding, str):
+            raise RuntimeError(
+                f"embed_text returned a string instead of a vector for chunk {idx}"
+            )
+
+        # 2) Store the embedding vector + model name
         db.execute(
             text("""
                 INSERT INTO embeddings (
@@ -477,8 +485,9 @@ def ingest_document_text(
                 "document_id": document_id,
                 "chunk_index": idx,
                 "chunk_text": chunk,
-                "embedding": EMBEDDING_MODEL,
-                "embedding_model": EMBEDDING_MODEL,
+                # 🔴 BUG WAS HERE: previously EMBEDDING_MODEL instead of embedding
+                "embedding": embedding,              # ✅ actual vector (list[float])
+                "embedding_model": EMBEDDING_MODEL,  # ✅ model name string
             },
         )
 
