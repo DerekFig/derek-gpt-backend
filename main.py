@@ -1225,6 +1225,4 @@ def update_workspace(
 
 @app.get("/whoami")
 def whoami():
-    # Temporary debug to prove which file is running
-    1 / 0  # <- this will raise ZeroDivisionError on every call
-
+    return {"running_file": "MAIN_PY_IS_RUNNING_V3"}
