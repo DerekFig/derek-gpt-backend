@@ -1225,4 +1225,4 @@ def update_workspace(
 
 @app.get("/whoami")
 def whoami():
-    return {"running_file": "MAIN_PY_IS_RUNNING"}
+    return {"running_file": "MAIN_PY_IS_RUNNING_V2"}
