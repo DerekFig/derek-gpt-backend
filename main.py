@@ -10,6 +10,11 @@ import fitz  # PyMuPDF
 from PIL import Image
 from pypdf import PdfReader
 from docx import Document as DocxDocument
+from io import BytesIO
+
+from pptx import Presentation
+from openpyxl import load_workbook
+
 
 from fastapi import (
     FastAPI,
@@ -500,15 +505,77 @@ def ingest_document_text(
     }
 
 
+def extract_text_from_pptx_bytes(content_bytes: bytes) -> str:
+    """
+    Extract text from a .pptx PowerPoint file.
+
+    Strategy:
+    - Load Presentation from in-memory bytes
+    - Iterate slides and shapes
+    - Collect any shape that exposes a .text attribute
+    - Prefix slide content with [Slide N] to preserve context
+    """
+    if not content_bytes:
+        return ""
+
+    prs = Presentation(BytesIO(content_bytes))
+    texts: list[str] = []
+
+    for slide_idx, slide in enumerate(prs.slides, start=1):
+        slide_text_parts: list[str] = []
+        for shape in slide.shapes:
+            if hasattr(shape, "text"):
+                text = (shape.text or "").strip()
+                if text:
+                    slide_text_parts.append(text)
+
+        if slide_text_parts:
+            texts.append(f"[Slide {slide_idx}]")
+            texts.append("\n".join(slide_text_parts))
+
+    return "\n\n".join(texts).strip()
+
+
+def extract_text_from_xlsx_bytes(content_bytes: bytes) -> str:
+    """
+    Extract a reasonable text representation from an .xlsx Excel file.
+
+    Strategy:
+    - Load workbook from in-memory bytes with openpyxl (data_only=True)
+    - For each sheet:
+        - Add a header line with sheet name
+        - Iterate rows; join non-empty cell values with tabs
+    """
+    if not content_bytes:
+        return ""
+
+    wb = load_workbook(BytesIO(content_bytes), data_only=True)
+    lines: list[str] = []
+
+    for sheet in wb.worksheets:
+        lines.append(f"[Sheet: {sheet.title}]")
+        for row in sheet.iter_rows(values_only=True):
+            row_values = [str(cell) for cell in row if cell is not None]
+            if row_values:
+                lines.append("\t".join(row_values))
+
+        lines.append("")  # blank line between sheets
+
+    return "\n".join(lines).strip()
+
+
 def extract_text_from_upload(file: UploadFile) -> str:
     filename = file.filename or "unnamed"
     lower_name = filename.lower()
 
+    # Single read, reused for all formats
     content_bytes = file.file.read()
 
+    # Plain text
     if lower_name.endswith(".txt") or lower_name.endswith(".md"):
         return content_bytes.decode("utf-8", errors="ignore")
 
+    # PDF (non-OCR path; OCR pipeline passes bytes separately and may fall back here)
     if lower_name.endswith(".pdf"):
         reader = PdfReader(io.BytesIO(content_bytes))
         pages_text = []
@@ -516,14 +583,47 @@ def extract_text_from_upload(file: UploadFile) -> str:
             pages_text.append(page.extract_text() or "")
         return "\n".join(pages_text)
 
+    # Word DOCX
     if lower_name.endswith(".docx"):
         doc = DocxDocument(io.BytesIO(content_bytes))
         paragraphs = [p.text for p in doc.paragraphs]
         return "\n".join(paragraphs)
 
+    # PowerPoint PPTX
+    if lower_name.endswith(".pptx"):
+        return extract_text_from_pptx_bytes(content_bytes)
+
+    # Legacy PowerPoint PPT
+    if lower_name.endswith(".ppt"):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Unsupported legacy PowerPoint file '{filename}'. "
+                "Please resave the file as .pptx and upload again."
+            ),
+        )
+
+    # Excel XLSX
+    if lower_name.endswith(".xlsx"):
+        return extract_text_from_xlsx_bytes(content_bytes)
+
+    # Legacy Excel XLS
+    if lower_name.endswith(".xls"):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Unsupported legacy Excel file '{filename}'. "
+                "Please resave the file as .xlsx and upload again."
+            ),
+        )
+
+    # Fallback unsupported
     raise HTTPException(
         status_code=400,
-        detail=f"Unsupported file type for '{filename}'. Supported: .txt, .md, .pdf, .docx",
+        detail=(
+            f"Unsupported file type for '{filename}'. "
+            "Supported: .txt, .md, .pdf, .docx, .pptx, .xlsx"
+        ),
     )
 
 
