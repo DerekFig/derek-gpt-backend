@@ -10,5 +10,5 @@ python-docx
 python-multipart
 Pillow
 pymupdf
-
-
+python-pptx>=0.6.21
+openpyxl>=3.1.2
