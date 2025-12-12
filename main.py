@@ -15,7 +15,6 @@ from io import BytesIO
 from pptx import Presentation
 from openpyxl import load_workbook
 
-
 from fastapi import (
     FastAPI,
     Depends,
@@ -40,7 +39,6 @@ from openai import OpenAI, RateLimitError
 from db import get_db
 
 import base64
-from io import BytesIO
 
 
 # --------------------------------------------------------
@@ -147,9 +145,7 @@ def ocr_pages_with_openai(page_images):
                         },
                         {
                             "type": "image_url",
-                            "image_url": {
-                                "url": f"data:image/png;base64,{b64}"
-                            },
+                            "image_url": {"url": f"data:image/png;base64,{b64}"},
                         },
                     ],
                 }
@@ -453,16 +449,13 @@ def ingest_document_text(
     chunks = chunk_text(content)
 
     for idx, chunk in enumerate(chunks):
-        # 1) Compute the numeric embedding vector for this chunk
         embedding = embed_text(chunk)
 
-        # Optional sanity check: make sure we didn't accidentally get a string
         if isinstance(embedding, str):
             raise RuntimeError(
                 f"embed_text returned a string instead of a vector for chunk {idx}"
             )
 
-        # 2) Store the embedding vector + model name
         db.execute(
             text("""
                 INSERT INTO embeddings (
@@ -490,9 +483,8 @@ def ingest_document_text(
                 "document_id": document_id,
                 "chunk_index": idx,
                 "chunk_text": chunk,
-                # 🔴 BUG WAS HERE: previously EMBEDDING_MODEL instead of embedding
-                "embedding": embedding,              # ✅ actual vector (list[float])
-                "embedding_model": EMBEDDING_MODEL,  # ✅ model name string
+                "embedding": embedding,
+                "embedding_model": EMBEDDING_MODEL,
             },
         )
 
@@ -506,15 +498,6 @@ def ingest_document_text(
 
 
 def extract_text_from_pptx_bytes(content_bytes: bytes) -> str:
-    """
-    Extract text from a .pptx PowerPoint file.
-
-    Strategy:
-    - Load Presentation from in-memory bytes
-    - Iterate slides and shapes
-    - Collect any shape that exposes a .text attribute
-    - Prefix slide content with [Slide N] to preserve context
-    """
     if not content_bytes:
         return ""
 
@@ -537,15 +520,6 @@ def extract_text_from_pptx_bytes(content_bytes: bytes) -> str:
 
 
 def extract_text_from_xlsx_bytes(content_bytes: bytes) -> str:
-    """
-    Extract a reasonable text representation from an .xlsx Excel file.
-
-    Strategy:
-    - Load workbook from in-memory bytes with openpyxl (data_only=True)
-    - For each sheet:
-        - Add a header line with sheet name
-        - Iterate rows; join non-empty cell values with tabs
-    """
     if not content_bytes:
         return ""
 
@@ -559,7 +533,7 @@ def extract_text_from_xlsx_bytes(content_bytes: bytes) -> str:
             if row_values:
                 lines.append("\t".join(row_values))
 
-        lines.append("")  # blank line between sheets
+        lines.append("")
 
     return "\n".join(lines).strip()
 
@@ -568,14 +542,11 @@ def extract_text_from_upload(file: UploadFile) -> str:
     filename = file.filename or "unnamed"
     lower_name = filename.lower()
 
-    # Single read, reused for all formats
     content_bytes = file.file.read()
 
-    # Plain text
     if lower_name.endswith(".txt") or lower_name.endswith(".md"):
         return content_bytes.decode("utf-8", errors="ignore")
 
-    # PDF (non-OCR path; OCR pipeline passes bytes separately and may fall back here)
     if lower_name.endswith(".pdf"):
         reader = PdfReader(io.BytesIO(content_bytes))
         pages_text = []
@@ -583,17 +554,14 @@ def extract_text_from_upload(file: UploadFile) -> str:
             pages_text.append(page.extract_text() or "")
         return "\n".join(pages_text)
 
-    # Word DOCX
     if lower_name.endswith(".docx"):
         doc = DocxDocument(io.BytesIO(content_bytes))
         paragraphs = [p.text for p in doc.paragraphs]
         return "\n".join(paragraphs)
 
-    # PowerPoint PPTX
     if lower_name.endswith(".pptx"):
         return extract_text_from_pptx_bytes(content_bytes)
 
-    # Legacy PowerPoint PPT
     if lower_name.endswith(".ppt"):
         raise HTTPException(
             status_code=400,
@@ -603,11 +571,9 @@ def extract_text_from_upload(file: UploadFile) -> str:
             ),
         )
 
-    # Excel XLSX
     if lower_name.endswith(".xlsx"):
         return extract_text_from_xlsx_bytes(content_bytes)
 
-    # Legacy Excel XLS
     if lower_name.endswith(".xls"):
         raise HTTPException(
             status_code=400,
@@ -617,7 +583,6 @@ def extract_text_from_upload(file: UploadFile) -> str:
             ),
         )
 
-    # Fallback unsupported
     raise HTTPException(
         status_code=400,
         detail=(
@@ -944,6 +909,36 @@ def debug_openai():
         )
 
 
+# NEW: quick sanity check for tenant/workspace visibility
+@app.get("/debug/rag-count", dependencies=[Depends(verify_internal_key)])
+def debug_rag_count(
+    tenant_id: str,
+    workspace_id: str,
+    db: Session = Depends(get_db),
+):
+    sql = text("""
+        SELECT COUNT(*) AS cnt
+        FROM embeddings e
+        JOIN workspaces w ON w.id = e.workspace_id
+        WHERE w.tenant_id = :tenant_id
+          AND e.workspace_id = :workspace_id;
+    """)
+
+    row = db.execute(
+        sql,
+        {
+            "tenant_id": UUID(tenant_id),
+            "workspace_id": UUID(workspace_id),
+        },
+    ).fetchone()
+
+    return {
+        "tenant_id": tenant_id,
+        "workspace_id": workspace_id,
+        "embedding_count": int(row.cnt if row and row.cnt is not None else 0),
+    }
+
+
 @app.post("/query", dependencies=[Depends(verify_internal_key)])
 def query_embeddings(
     payload: QueryRequest,
@@ -956,22 +951,23 @@ def query_embeddings(
             e.document_id,
             e.chunk_index,
             e.chunk_text,
-            1 - (e.embedding <=> CAST(:query_embedding AS vector(1024))) AS score,
+            1 - (e.embedding <=> :query_embedding) AS score,
             d.original_filename,
             d.source_type
         FROM embeddings e
         JOIN documents d ON d.id = e.document_id
-        WHERE e.tenant_id = :tenant_id
+        JOIN workspaces w ON w.id = e.workspace_id
+        WHERE w.tenant_id = :tenant_id
           AND e.workspace_id = :workspace_id
-        ORDER BY e.embedding <=> CAST(:query_embedding AS vector(1024))
+        ORDER BY e.embedding <=> :query_embedding
         LIMIT :top_k;
     """)
 
     rows = db.execute(
         sql,
         {
-            "tenant_id": payload.tenant_id,
-            "workspace_id": payload.workspace_id,
+            "tenant_id": UUID(payload.tenant_id),
+            "workspace_id": UUID(payload.workspace_id),
             "query_embedding": query_embedding,
             "top_k": payload.top_k,
         },
@@ -1100,22 +1096,23 @@ def chat_with_workspace(
 
     sql = text("""
         SELECT
-            document_id,
-            chunk_index,
-            chunk_text,
-            1 - (embedding <=> CAST(:query_embedding AS vector(1024))) AS score
-        FROM embeddings
-        WHERE tenant_id = :tenant_id
-          AND workspace_id = :workspace_id
-        ORDER BY embedding <=> CAST(:query_embedding AS vector(1024))
+            e.document_id,
+            e.chunk_index,
+            e.chunk_text,
+            1 - (e.embedding <=> :query_embedding) AS score
+        FROM embeddings e
+        JOIN workspaces w ON w.id = e.workspace_id
+        WHERE w.tenant_id = :tenant_id
+          AND e.workspace_id = :workspace_id
+        ORDER BY e.embedding <=> :query_embedding
         LIMIT :top_k;
     """)
 
     rows = db.execute(
         sql,
         {
-            "tenant_id": payload.tenant_id,
-            "workspace_id": payload.workspace_id,
+            "tenant_id": UUID(payload.tenant_id),
+            "workspace_id": UUID(payload.workspace_id),
             "query_embedding": query_embedding,
             "top_k": payload.top_k,
         },
@@ -1198,22 +1195,23 @@ def chat_with_workspace_stream(
 
     sql = text("""
         SELECT
-            document_id,
-            chunk_index,
-            chunk_text,
-            1 - (embedding <=> CAST(:query_embedding AS vector(1024))) AS score
-        FROM embeddings
-        WHERE tenant_id = :tenant_id
-          AND workspace_id = :workspace_id
-        ORDER BY embedding <=> CAST(:query_embedding AS vector(1024))
+            e.document_id,
+            e.chunk_index,
+            e.chunk_text,
+            1 - (e.embedding <=> :query_embedding) AS score
+        FROM embeddings e
+        JOIN workspaces w ON w.id = e.workspace_id
+        WHERE w.tenant_id = :tenant_id
+          AND e.workspace_id = :workspace_id
+        ORDER BY e.embedding <=> :query_embedding
         LIMIT :top_k;
     """)
 
     rows = db.execute(
         sql,
         {
-            "tenant_id": payload.tenant_id,
-            "workspace_id": payload.workspace_id,
+            "tenant_id": UUID(payload.tenant_id),
+            "workspace_id": UUID(payload.workspace_id),
             "query_embedding": query_embedding,
             "top_k": payload.top_k,
         },
