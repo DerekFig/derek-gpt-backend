@@ -3,6 +3,7 @@
 import io
 import json
 import os
+import hashlib
 from uuid import UUID
 from typing import Optional, List
 
@@ -325,6 +326,10 @@ class QueryResult(BaseModel):
 # Helper functions
 # --------------------------------------------------------
 
+def sha256_bytes(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
 def get_workspace_config(db: Session, workspace_id: str):
     row = db.execute(
         text("""
@@ -474,6 +479,9 @@ def ingest_document_text(
     original_filename: str,
     content: str,
     metadata: Optional[dict] = None,
+    *,
+    document_id: Optional[str] = None,
+    file_hash: Optional[str] = None,
 ):
     metadata = metadata or {}
 
@@ -481,37 +489,84 @@ def ingest_document_text(
     if not source_type:
         source_type = classify_source_type(original_filename, content)
 
-    result = db.execute(
-        text("""
-            INSERT INTO documents (
-                workspace_id,
-                original_filename,
-                content_text,
-                metadata,
-                source_type,
-                primary_embedding_model
-            )
-            VALUES (
-                :workspace_id,
-                :original_filename,
-                :content_text,
-                :metadata,
-                :source_type,
-                :primary_embedding_model
-            )
-            RETURNING id;
-        """),
-        {
-            "workspace_id": UUID(workspace_id),
-            "original_filename": original_filename,
-            "content_text": content,
-            "metadata": json.dumps(metadata) if metadata else None,
-            "source_type": source_type,
-            "primary_embedding_model": EMBEDDING_MODEL,
-        },
-    )
-    doc_row = result.fetchone()
-    document_id = doc_row.id
+    replaced = False
+
+    # If we are reusing an existing document, clear old embeddings first.
+    if document_id:
+        replaced = True
+        db.execute(
+            text("""
+                DELETE FROM embeddings
+                WHERE document_id = :document_id
+                  AND workspace_id = :workspace_id
+            """),
+            {
+                "document_id": UUID(document_id),
+                "workspace_id": UUID(workspace_id),
+            },
+        )
+
+        # Optional: update the document row's content/metadata/hash to match the latest ingest
+        db.execute(
+            text("""
+                UPDATE documents
+                SET
+                    original_filename = :original_filename,
+                    content_text = :content_text,
+                    metadata = :metadata,
+                    source_type = :source_type,
+                    primary_embedding_model = :primary_embedding_model,
+                    file_hash = :file_hash
+                WHERE id = :document_id
+                  AND workspace_id = :workspace_id
+            """),
+            {
+                "document_id": UUID(document_id),
+                "workspace_id": UUID(workspace_id),
+                "original_filename": original_filename,
+                "content_text": content,
+                "metadata": json.dumps(metadata) if metadata else None,
+                "source_type": source_type,
+                "primary_embedding_model": EMBEDDING_MODEL,
+                "file_hash": file_hash,
+            },
+        )
+    else:
+        # New document insert (now includes file_hash)
+        result = db.execute(
+            text("""
+                INSERT INTO documents (
+                    workspace_id,
+                    original_filename,
+                    content_text,
+                    metadata,
+                    source_type,
+                    primary_embedding_model,
+                    file_hash
+                )
+                VALUES (
+                    :workspace_id,
+                    :original_filename,
+                    :content_text,
+                    :metadata,
+                    :source_type,
+                    :primary_embedding_model,
+                    :file_hash
+                )
+                RETURNING id;
+            """),
+            {
+                "workspace_id": UUID(workspace_id),
+                "original_filename": original_filename,
+                "content_text": content,
+                "metadata": json.dumps(metadata) if metadata else None,
+                "source_type": source_type,
+                "primary_embedding_model": EMBEDDING_MODEL,
+                "file_hash": file_hash,
+            },
+        )
+        doc_row = result.fetchone()
+        document_id = str(doc_row.id)
 
     chunks = chunk_text(content)
 
@@ -547,7 +602,7 @@ def ingest_document_text(
             {
                 "tenant_id": UUID(tenant_id),
                 "workspace_id": UUID(workspace_id),
-                "document_id": document_id,
+                "document_id": UUID(document_id),
                 "chunk_index": idx,
                 "chunk_text": chunk,
                 "embedding": embedding,              # ✅ vector values
@@ -561,6 +616,8 @@ def ingest_document_text(
         "document_id": str(document_id),
         "num_chunks": len(chunks),
         "source_type": source_type,
+        "replaced": replaced,
+        "file_hash": file_hash,
     }
 
 
@@ -1054,6 +1111,7 @@ def ingest_document(
         original_filename=payload.original_filename,
         content=payload.content,
         metadata=payload.metadata,
+        file_hash=None,
     )
 
 
@@ -1105,6 +1163,7 @@ def upload_file(
             original_filename=f.filename or "uploaded_file",
             content=text_content,
             metadata=metadata_dict,
+            file_hash=None,
         )
         results.append(ingest_result)
 
@@ -1126,6 +1185,23 @@ def ingest_from_storage(
     db: Session = Depends(get_db),
 ):
     file_bytes = download_from_supabase_storage(SUPABASE_STORAGE_BUCKET, payload.storage_path)
+    file_hash = sha256_bytes(file_bytes)
+
+    # Check for duplicate in same workspace by (workspace_id, file_hash)
+    existing = db.execute(
+        text("""
+            SELECT id
+            FROM documents
+            WHERE workspace_id = :workspace_id
+              AND file_hash = :file_hash
+            LIMIT 1
+        """),
+        {
+            "workspace_id": UUID(payload.workspace_id),
+            "file_hash": file_hash,
+        },
+    ).fetchone()
+    existing_document_id = str(existing.id) if existing else None
 
     filename_lower = (payload.original_filename or "").lower()
     text_content: Optional[str] = None
@@ -1191,6 +1267,8 @@ def ingest_from_storage(
         original_filename=payload.original_filename,
         content=text_content,
         metadata=payload.metadata,
+        document_id=existing_document_id,
+        file_hash=file_hash,
     )
 
     return {"result": ingest_result}
