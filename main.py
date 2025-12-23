@@ -39,7 +39,12 @@ from openai import OpenAI, RateLimitError
 from db import get_db
 
 import base64
-from io import BytesIO
+
+# ----------------------------
+# NEW: Supabase Storage support
+# ----------------------------
+import requests
+from supabase import create_client, Client
 
 
 # --------------------------------------------------------
@@ -80,6 +85,45 @@ def verify_admin(x_admin_api_key: str = Header(None)):
     """
     if x_admin_api_key != ADMIN_API_KEY:
         raise HTTPException(status_code=403, detail="Forbidden")
+
+
+# --------------------------------------------------------
+# NEW: Supabase Storage config (backend-only)
+# --------------------------------------------------------
+
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+SUPABASE_STORAGE_BUCKET = os.getenv("SUPABASE_STORAGE_BUCKET", "documents")
+
+supabase: Optional[Client] = None
+if SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY:
+    supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
+
+
+def download_from_supabase_storage(bucket: str, path: str) -> bytes:
+    """
+    Download object bytes from Supabase Storage via a short-lived signed URL.
+    Requires SUPABASE_URL + SUPABASE_SERVICE_ROLE_KEY in backend env.
+    """
+    if supabase is None:
+        raise HTTPException(
+            status_code=500,
+            detail="Supabase Storage not configured on backend (missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY).",
+        )
+
+    signed = supabase.storage.from_(bucket).create_signed_url(path, 60)  # 60 seconds
+    signed_url = signed.get("signedURL") or signed.get("signedUrl")
+    if not signed_url:
+        raise HTTPException(status_code=500, detail="Failed to create signed URL for storage object.")
+
+    r = requests.get(signed_url, timeout=120)
+    if r.status_code != 200:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Failed to download file from storage (HTTP {r.status_code}).",
+        )
+
+    return r.content
 
 
 # --------------------------------------------------------
@@ -247,6 +291,17 @@ class DocumentIn(BaseModel):
     workspace_id: str
     original_filename: str
     content: str
+    metadata: Optional[dict] = None
+
+
+# ----------------------------
+# NEW: ingest-from-storage model
+# ----------------------------
+class StorageIngestRequest(BaseModel):
+    tenant_id: str
+    workspace_id: str
+    original_filename: str
+    storage_path: str
     metadata: Optional[dict] = None
 
 
@@ -1060,6 +1115,85 @@ def upload_file(
         )
 
     return {"results": results}
+
+
+# ----------------------------
+# NEW: Ingest from Supabase Storage (by storage_path)
+# ----------------------------
+@app.post("/ingest-from-storage", dependencies=[Depends(verify_internal_key)])
+def ingest_from_storage(
+    payload: StorageIngestRequest,
+    db: Session = Depends(get_db),
+):
+    file_bytes = download_from_supabase_storage(SUPABASE_STORAGE_BUCKET, payload.storage_path)
+
+    filename_lower = (payload.original_filename or "").lower()
+    text_content: Optional[str] = None
+
+    if filename_lower.endswith(".pdf"):
+        ocr_text = extract_text_from_pdf_bytes_with_ocr(file_bytes)
+        print("DEBUG: OCR text length for", payload.original_filename, "=", len(ocr_text or ""))
+
+        if ocr_text and ocr_text.strip():
+            text_content = "[USING_OCR]\n" + ocr_text
+        else:
+            reader = PdfReader(io.BytesIO(file_bytes))
+            pages_text = [(p.extract_text() or "") for p in reader.pages]
+            text_content = "\n".join(pages_text)
+
+    elif filename_lower.endswith(".docx"):
+        doc = DocxDocument(io.BytesIO(file_bytes))
+        text_content = "\n".join([p.text for p in doc.paragraphs])
+
+    elif filename_lower.endswith(".pptx"):
+        text_content = extract_text_from_pptx_bytes(file_bytes)
+
+    elif filename_lower.endswith(".xlsx"):
+        text_content = extract_text_from_xlsx_bytes(file_bytes)
+
+    elif filename_lower.endswith(".txt") or filename_lower.endswith(".md"):
+        text_content = file_bytes.decode("utf-8", errors="ignore")
+
+    elif filename_lower.endswith(".ppt"):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Unsupported legacy PowerPoint file '{payload.original_filename}'. "
+                "Please resave the file as .pptx and upload again."
+            ),
+        )
+
+    elif filename_lower.endswith(".xls"):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Unsupported legacy Excel file '{payload.original_filename}'. "
+                "Please resave the file as .xlsx and upload again."
+            ),
+        )
+
+    else:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Unsupported file type for '{payload.original_filename}'. "
+                "Supported: .txt, .md, .pdf, .docx, .pptx, .xlsx"
+            ),
+        )
+
+    if not text_content or not text_content.strip():
+        raise HTTPException(status_code=400, detail="No text could be extracted from the file.")
+
+    ingest_result = ingest_document_text(
+        db=db,
+        tenant_id=payload.tenant_id,
+        workspace_id=payload.workspace_id,
+        original_filename=payload.original_filename,
+        content=text_content,
+        metadata=payload.metadata,
+    )
+
+    return {"result": ingest_result}
 
 
 @app.post(
