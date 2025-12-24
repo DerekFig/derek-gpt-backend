@@ -81,6 +81,9 @@ app = FastAPI()
 from ingest_routes import router as ingest_router
 app.include_router(ingest_router)
 
+from rag_routes import router as rag_router
+app.include_router(rag_router)
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
