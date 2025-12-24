@@ -4,7 +4,7 @@ from fastapi import Header, HTTPException
 
 INTERNAL_BACKEND_KEY = os.getenv("INTERNAL_BACKEND_KEY")
 
-def verify_internal_key(x_internal_key: str = Header(None)):
+def verify_internal_key(x_internal_key: str = Header(None, alias="X-Internal-Key")):
     """
     Require X-Internal-Key for protected endpoints.
     """
