@@ -446,6 +446,34 @@ def extract_text_from_xlsx_bytes(content_bytes: bytes) -> str:
     return "\n".join(lines).strip()
 
 
+def extract_text_from_docx_bytes(content_bytes: bytes) -> str:
+    """
+    Extract text from a .docx file provided as bytes.
+    Note: .docx is a zip container; do NOT decode as UTF-8.
+    """
+    if not content_bytes:
+        return ""
+
+    doc = DocxDocument(io.BytesIO(content_bytes))
+    paragraphs = [p.text for p in doc.paragraphs if (p.text or "").strip()]
+
+    # Optional: include simple table text if present
+    try:
+        for table in doc.tables:
+            for row in table.rows:
+                cells = [(c.text or "").strip() for c in row.cells]
+                cells = [c for c in cells if c]
+                if cells:
+                    paragraphs.append(" | ".join(cells))
+    except Exception:
+        pass
+
+    text_out = "\n".join(paragraphs)
+
+    # Defensive: Postgres cannot store NUL bytes in text
+    return text_out.replace("\x00", "")
+
+
 def extract_text_from_upload(file: UploadFile) -> str:
     filename = file.filename or "unnamed"
     lower_name = filename.lower()
@@ -463,9 +491,7 @@ def extract_text_from_upload(file: UploadFile) -> str:
         return "\n".join(pages_text)
 
     if lower_name.endswith(".docx"):
-        doc = DocxDocument(io.BytesIO(content_bytes))
-        paragraphs = [p.text for p in doc.paragraphs]
-        return "\n".join(paragraphs)
+        return extract_text_from_docx_bytes(content_bytes)
 
     if lower_name.endswith(".pptx"):
         return extract_text_from_pptx_bytes(content_bytes)
