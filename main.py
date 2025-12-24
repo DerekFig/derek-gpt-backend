@@ -43,6 +43,20 @@ import base64
 
 from security import verify_internal_key
 
+from sqlalchemy import text
+
+@app.get("/debug/ingest-tables", dependencies=[Depends(verify_internal_key)])
+def debug_ingest_tables(db: Session = Depends(get_db)):
+    rows = db.execute(text("""
+        SELECT table_name
+        FROM information_schema.tables
+        WHERE table_schema = 'public'
+          AND table_name IN ('ingest_jobs','ingest_job_items')
+        ORDER BY table_name;
+    """)).fetchall()
+    return {"tables": [r.table_name for r in rows]}
+
+
 # ----------------------------
 # NEW: Supabase Storage support
 # ----------------------------
