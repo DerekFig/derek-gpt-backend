@@ -4,14 +4,18 @@ from sqlalchemy.orm import Session
 from sqlalchemy import select
 from uuid import UUID
 
+from db import get_db
+from security import verify_internal_key
 from schemas_ingest import IngestJobOut, IngestJobItemOut
-from main import IngestJob, IngestJobItem
-from db import get_db  # adjust import to your SessionLocal dependency
-from security import require_internal_key  # adjust to your X-Internal-Key dependency
+from models_ingest import IngestJob, IngestJobItem
 
 router = APIRouter()
 
-@router.get("/ingest-jobs/{job_id}", response_model=IngestJobOut, dependencies=[Depends(require_internal_key)])
+@router.get(
+    "/ingest-jobs/{job_id}",
+    response_model=IngestJobOut,
+    dependencies=[Depends(verify_internal_key)],
+)
 def get_ingest_job_status(
     job_id: UUID,
     db: Session = Depends(get_db),
@@ -19,7 +23,10 @@ def get_ingest_job_status(
     offset: int = Query(0, ge=0),
 ):
     # 1) Fetch job
-    job = db.execute(select(IngestJob).where(IngestJob.id == job_id)).scalars().first()
+    job = db.execute(
+        select(IngestJob).where(IngestJob.id == job_id)
+    ).scalars().first()
+
     if not job:
         raise HTTPException(status_code=404, detail="Ingest job not found")
 
