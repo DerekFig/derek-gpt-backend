@@ -1290,16 +1290,20 @@ def chat_with_workspace(
     query_embedding = embed_text(payload.query)
     query_vec = embedding_to_pgvector_literal(query_embedding)
 
+    # UPDATED: join documents so we can include filename/source_type in context
     sql = text(f"""
         SELECT
-            document_id,
-            chunk_index,
-            chunk_text,
-            1 - (embedding <=> CAST(:query_embedding AS vector({EMBEDDING_DIM}))) AS score
-        FROM embeddings
-        WHERE tenant_id = :tenant_id
-          AND workspace_id = :workspace_id
-          AND embedding_model = :embedding_model
+            e.document_id,
+            e.chunk_index,
+            e.chunk_text,
+            1 - (e.embedding <=> CAST(:query_embedding AS vector({EMBEDDING_DIM}))) AS score,
+            d.original_filename,
+            d.source_type
+        FROM embeddings e
+        JOIN documents d ON d.id = e.document_id
+        WHERE e.tenant_id = :tenant_id
+          AND e.workspace_id = :workspace_id
+          AND e.embedding_model = :embedding_model
         ORDER BY score DESC
         LIMIT :top_k;
     """)
@@ -1315,7 +1319,15 @@ def chat_with_workspace(
         },
     ).fetchall()
 
-    contexts = [row.chunk_text for row in rows]
+    # UPDATED: richer context with provenance
+    contexts: List[str] = []
+    for row in rows:
+        fname = getattr(row, "original_filename", None) or "unknown"
+        stype = getattr(row, "source_type", None) or "unknown"
+        contexts.append(
+            f"[SOURCE: {fname} | type={stype} | doc={row.document_id} | chunk={row.chunk_index} | score={float(row.score):.3f}]\n"
+            f"{row.chunk_text}"
+        )
 
     if not contexts:
         return {
@@ -1335,16 +1347,30 @@ def chat_with_workspace(
 
     history_block = "\n".join(history_lines) if history_lines else "None so far."
 
+    q = (payload.query or "").strip()
+    q_lower = q.lower()
+
+    interpretation_hint = ""
+    if q_lower.startswith("who is ") or q_lower.startswith("who are "):
+        interpretation_hint = (
+            "Interpret 'who is/are X' flexibly. If X appears to be a company or organization, "
+            "answer what it is and identify the principals/founders/leaders mentioned in the context.\n\n"
+        )
+
+    # UPDATED: extraction-first prompt reduces overly literal failures
     base_context_prompt = (
-        "You are DerekGPT, a helpful assistant answering questions based on the context.\n\n"
-        "Context (from documents):\n"
+        interpretation_hint
+        + "You are answering using only the provided document context.\n\n"
+          "DOCUMENT CONTEXT:\n"
         + "\n\n---\n\n".join(contexts)
-        + "\n\nConversation so far:\n"
+        + "\n\nCONVERSATION HISTORY:\n"
         + history_block
-        + "\n\nUser's new question: "
-        + payload.query
-        + "\n\nAnswer concisely based only on the context above. "
-          "If something is not in the context, say you don't know."
+        + "\n\nUSER QUESTION:\n"
+        + q
+        + "\n\nINSTRUCTIONS:\n"
+          "1) First, extract the 3–8 most relevant facts from the context as short bullets.\n"
+          "2) Then answer the question in 2–6 sentences using those facts.\n"
+          "3) If the context truly contains no relevant facts, say: 'I don't have that in the documents yet.'\n"
     )
 
     cfg = get_workspace_config(db, payload.workspace_id)
@@ -1366,6 +1392,7 @@ def chat_with_workspace(
 
     answer = completion.choices[0].message.content
 
+    # UPDATED: return provenance to the frontend for debugging
     results = []
     for row in rows:
         results.append(
@@ -1374,6 +1401,8 @@ def chat_with_workspace(
                 "chunk_index": row.chunk_index,
                 "score": float(row.score),
                 "chunk_text": row.chunk_text,
+                "original_filename": getattr(row, "original_filename", None),
+                "source_type": getattr(row, "source_type", None),
             }
         )
 
@@ -1391,16 +1420,20 @@ def chat_with_workspace_stream(
     query_embedding = embed_text(payload.query)
     query_vec = embedding_to_pgvector_literal(query_embedding)
 
+    # UPDATED: join documents so we can include filename/source_type in context
     sql = text(f"""
         SELECT
-            document_id,
-            chunk_index,
-            chunk_text,
-            1 - (embedding <=> CAST(:query_embedding AS vector({EMBEDDING_DIM}))) AS score
-        FROM embeddings
-        WHERE tenant_id = :tenant_id
-          AND workspace_id = :workspace_id
-          AND embedding_model = :embedding_model
+            e.document_id,
+            e.chunk_index,
+            e.chunk_text,
+            1 - (e.embedding <=> CAST(:query_embedding AS vector({EMBEDDING_DIM}))) AS score,
+            d.original_filename,
+            d.source_type
+        FROM embeddings e
+        JOIN documents d ON d.id = e.document_id
+        WHERE e.tenant_id = :tenant_id
+          AND e.workspace_id = :workspace_id
+          AND e.embedding_model = :embedding_model
         ORDER BY score DESC
         LIMIT :top_k;
     """)
@@ -1416,7 +1449,15 @@ def chat_with_workspace_stream(
         },
     ).fetchall()
 
-    contexts = [row.chunk_text for row in rows]
+    # UPDATED: richer context with provenance
+    contexts: List[str] = []
+    for row in rows:
+        fname = getattr(row, "original_filename", None) or "unknown"
+        stype = getattr(row, "source_type", None) or "unknown"
+        contexts.append(
+            f"[SOURCE: {fname} | type={stype} | doc={row.document_id} | chunk={row.chunk_index} | score={float(row.score):.3f}]\n"
+            f"{row.chunk_text}"
+        )
 
     if not contexts:
         def empty_gen():
@@ -1434,16 +1475,29 @@ def chat_with_workspace_stream(
 
     history_block = "\n".join(history_lines) if history_lines else "None so far."
 
+    q = (payload.query or "").strip()
+    q_lower = q.lower()
+
+    interpretation_hint = ""
+    if q_lower.startswith("who is ") or q_lower.startswith("who are "):
+        interpretation_hint = (
+            "Interpret 'who is/are X' flexibly. If X appears to be a company or organization, "
+            "answer what it is and identify the principals/founders/leaders mentioned in the context.\n\n"
+        )
+
     base_context_prompt = (
-        "You are DerekGPT, a helpful assistant answering questions based on the context.\n\n"
-        "Context (from documents):\n"
+        interpretation_hint
+        + "You are answering using only the provided document context.\n\n"
+          "DOCUMENT CONTEXT:\n"
         + "\n\n---\n\n".join(contexts)
-        + "\n\nConversation so far:\n"
+        + "\n\nCONVERSATION HISTORY:\n"
         + history_block
-        + "\n\nUser's new question: "
-        + payload.query
-        + "\n\nAnswer concisely based only on the context above. "
-          "If something is not in the context, say you don't know."
+        + "\n\nUSER QUESTION:\n"
+        + q
+        + "\n\nINSTRUCTIONS:\n"
+          "1) First, extract the 3–8 most relevant facts from the context as short bullets.\n"
+          "2) Then answer the question in 2–6 sentences using those facts.\n"
+          "3) If the context truly contains no relevant facts, say: 'I don't have that in the documents yet.'\n"
     )
 
     cfg = get_workspace_config(db, payload.workspace_id)
