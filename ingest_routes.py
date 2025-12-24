@@ -21,6 +21,7 @@ from ingest_helpers import (
     extract_text_from_pdf_bytes_with_ocr,
     extract_text_from_pptx_bytes,
     extract_text_from_xlsx_bytes,
+    extract_text_from_docx_bytes,
     ingest_document_text,
 )
 
@@ -74,6 +75,10 @@ class IngestJobOut(BaseModel):
 def _bucket() -> str:
     return os.getenv("SUPABASE_STORAGE_BUCKET", "documents")
 
+def _sanitize_text_for_db(text_in: str) -> str:
+    # Postgres TEXT cannot contain NUL bytes
+    return (text_in or "").replace("\x00", "")
+
 def process_ingest_job(job_id: UUID) -> None:
     db: Session = SessionLocal()
     try:
@@ -120,14 +125,29 @@ def process_ingest_job(job_id: UUID) -> None:
                 file_bytes = download_from_supabase_storage(bucket=bucket, path=item.storage_path)
 
                 path_lower = (item.storage_path or "").lower()
+
                 if path_lower.endswith(".pdf"):
                     content = extract_text_from_pdf_bytes_with_ocr(file_bytes)
+
                 elif path_lower.endswith(".pptx"):
                     content = extract_text_from_pptx_bytes(file_bytes)
+
                 elif path_lower.endswith(".xlsx"):
                     content = extract_text_from_xlsx_bytes(file_bytes)
-                else:
+
+                elif path_lower.endswith(".docx"):
+                    content = extract_text_from_docx_bytes(file_bytes)
+
+                elif path_lower.endswith(".txt") or path_lower.endswith(".md"):
                     content = file_bytes.decode("utf-8", errors="ignore")
+
+                else:
+                    raise ValueError(
+                        f"Unsupported file type for storage_path '{item.storage_path}'. "
+                        "Supported: .pdf, .pptx, .xlsx, .docx, .txt, .md"
+                    )
+
+                content = _sanitize_text_for_db(content)
 
                 ingest_document_text(
                     db=db,
