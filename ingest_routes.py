@@ -1,4 +1,7 @@
 # ingest_routes.py
+
+from __future__ import annotations
+
 from datetime import datetime
 from uuid import UUID
 
@@ -10,6 +13,28 @@ from sqlalchemy.orm import Session
 from db import get_db
 from security import verify_internal_key
 from models_ingest import IngestJob, IngestJobItem
+
+# ----------------------------
+# Helper imports (download, OCR/extract, ingest)
+# ----------------------------
+# Preferred: keep these in ingest_helpers.py so ingest_routes.py stays clean.
+# Fallback: try importing from main.py if helpers currently live there.
+try:
+    from ingest_helpers import (
+        download_from_supabase_storage,
+        extract_text_from_pdf_bytes_with_ocr,
+        extract_text_from_pptx_bytes,
+        extract_text_from_xlsx_bytes,
+        ingest_document_text,
+    )
+except Exception:
+    from main import (  # type: ignore
+        download_from_supabase_storage,
+        extract_text_from_pdf_bytes_with_ocr,
+        extract_text_from_pptx_bytes,
+        extract_text_from_xlsx_bytes,
+        ingest_document_text,
+    )
 
 router = APIRouter()
 
@@ -55,7 +80,154 @@ class IngestJobOut(BaseModel):
     items: list[IngestJobItemOut]
 
 # ----------------------------
-# Step 1: Create job (FAST, no ingestion)
+# Background processor
+# ----------------------------
+
+def process_ingest_job(job_id: UUID) -> None:
+    """
+    MVP background worker:
+    - Uses existing helper logic for download/extract/ingest
+    - Updates per-item status and job counters
+    """
+
+    # IMPORTANT: Background tasks must NOT reuse request DB session.
+    db_gen = get_db()
+    db: Session = next(db_gen)
+
+    try:
+        job = db.execute(select(IngestJob).where(IngestJob.id == job_id)).scalars().first()
+        if not job:
+            return
+
+        # Mark job processing
+        job.status = "processing"
+        job.updated_at = datetime.utcnow()
+        db.commit()
+
+        # Load items in order
+        items = db.execute(
+            select(IngestJobItem)
+            .where(IngestJobItem.job_id == job_id)
+            .order_by(IngestJobItem.created_at.asc())
+        ).scalars().all()
+
+        for item in items:
+            # Skip already-finished items
+            if item.status in ("completed", "failed"):
+                continue
+
+            # If attempts exhausted, mark failed and continue
+            max_attempts = item.max_attempts or 3
+            attempts = item.attempts or 0
+            if attempts >= max_attempts:
+                item.status = "failed"
+                if not item.error:
+                    item.error = "Max attempts reached"
+                item.updated_at = datetime.utcnow()
+                db.commit()
+
+                job.failed_files = (job.failed_files or 0) + 1
+                job.updated_at = datetime.utcnow()
+                db.commit()
+                continue
+
+            # Mark item processing + bump attempts
+            item.status = "processing"
+            item.attempts = attempts + 1
+            item.updated_at = datetime.utcnow()
+            db.commit()
+
+            try:
+                # 1) Download file bytes from Supabase Storage
+                # Your helper should accept bucket/path. If your helper signature differs,
+                # adjust only this call.
+                file_bytes = download_from_supabase_storage(
+                    bucket=None,  # many implementations default internally; change if needed
+                    path=item.storage_path,
+                )
+
+                # 2) Extract text based on file extension
+                path_lower = (item.storage_path or "").lower()
+
+                if path_lower.endswith(".pdf"):
+                    text_content = extract_text_from_pdf_bytes_with_ocr(file_bytes)
+                elif path_lower.endswith(".pptx"):
+                    text_content = extract_text_from_pptx_bytes(file_bytes)
+                elif path_lower.endswith(".xlsx"):
+                    text_content = extract_text_from_xlsx_bytes(file_bytes)
+                else:
+                    # Default: treat as text
+                    text_content = file_bytes.decode("utf-8", errors="ignore")
+
+                # 3) Ingest text (your existing chunk/embed/dedupe logic)
+                # Adjust argument names if your helper uses different names.
+                ingest_document_text(
+                    tenant_id=job.tenant_id,
+                    workspace_id=job.workspace_id,
+                    text=text_content,
+                    source_path=item.storage_path,
+                    original_filename=item.original_filename,
+                )
+
+                # 4) Mark item completed
+                item.status = "completed"
+                item.error = None
+                item.updated_at = datetime.utcnow()
+                db.commit()
+
+                # 5) Update job counters
+                job.processed_files = (job.processed_files or 0) + 1
+                job.updated_at = datetime.utcnow()
+                db.commit()
+
+            except Exception as e:
+                # Mark item failed for now; if attempts remain we re-queue it
+                item.error = str(e)
+                item.updated_at = datetime.utcnow()
+
+                # Re-queue if we still have attempts left
+                if item.attempts < max_attempts:
+                    item.status = "queued"
+                else:
+                    item.status = "failed"
+                    job.failed_files = (job.failed_files or 0) + 1
+
+                db.commit()
+
+                job.updated_at = datetime.utcnow()
+                db.commit()
+
+        # Finalize job status
+        remaining = db.execute(
+            select(IngestJobItem)
+            .where(IngestJobItem.job_id == job_id)
+            .where(IngestJobItem.status.in_(["queued", "processing"]))
+        ).scalars().first()
+
+        if remaining:
+            job.status = "processing"
+        else:
+            # simple rule: any failures => failed, otherwise completed
+            if (job.failed_files or 0) > 0:
+                job.status = "failed"
+            else:
+                job.status = "completed"
+
+        job.updated_at = datetime.utcnow()
+        db.commit()
+
+    finally:
+        try:
+            db.close()
+        except Exception:
+            pass
+        try:
+            next(db_gen)
+        except Exception:
+            pass
+
+# ----------------------------
+# Step 1: Create job (FAST) + kick off ingestion
 # ----------------------------
 
 @router.post(
@@ -63,7 +235,11 @@ class IngestJobOut(BaseModel):
     response_model=IngestJobCreateOut,
     dependencies=[Depends(verify_internal_key)],
 )
-def create_ingest_job(payload: IngestJobCreateIn, db: Session = Depends(get_db)):
+def create_ingest_job(
+    payload: IngestJobCreateIn,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+):
     # Validate workspace exists and belongs to tenant (uses your existing tables)
     ws = db.execute(
         text("""
@@ -114,6 +290,9 @@ def create_ingest_job(payload: IngestJobCreateIn, db: Session = Depends(get_db))
 
     db.add_all(items)
     db.commit()
+
+    # Kick off background ingestion
+    background_tasks.add_task(process_ingest_job, job.id)
 
     return IngestJobCreateOut(job_id=job.id, total_files=job.total_files, status=job.status)
 
