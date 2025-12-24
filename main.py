@@ -133,6 +133,9 @@ def download_from_supabase_storage(bucket: str, path: str) -> bytes:
 
 app = FastAPI()
 
+from ingest_routes import router as ingest_router
+app.include_router(ingest_router)
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
