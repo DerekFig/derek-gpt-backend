@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import os
 from datetime import datetime
+from typing import Optional
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, BackgroundTasks
@@ -79,9 +81,13 @@ class IngestJobOut(BaseModel):
     updated_at: datetime
     items: list[IngestJobItemOut]
 
+
 # ----------------------------
 # Background processor
 # ----------------------------
+
+def _get_bucket_default() -> str:
+    return os.getenv("SUPABASE_STORAGE_BUCKET", "documents")
 
 def process_ingest_job(job_id: UUID) -> None:
     """
@@ -90,7 +96,7 @@ def process_ingest_job(job_id: UUID) -> None:
     - Updates per-item status and job counters
     """
 
-    # IMPORTANT: Background tasks must NOT reuse request DB session.
+    # IMPORTANT: Background tasks must NOT reuse the request DB session.
     db_gen = get_db()
     db: Session = next(db_gen)
 
@@ -111,14 +117,17 @@ def process_ingest_job(job_id: UUID) -> None:
             .order_by(IngestJobItem.created_at.asc())
         ).scalars().all()
 
+        bucket = _get_bucket_default()
+
         for item in items:
             # Skip already-finished items
             if item.status in ("completed", "failed"):
                 continue
 
-            # If attempts exhausted, mark failed and continue
             max_attempts = item.max_attempts or 3
             attempts = item.attempts or 0
+
+            # If attempts exhausted, mark failed and move on
             if attempts >= max_attempts:
                 item.status = "failed"
                 if not item.error:
@@ -139,12 +148,7 @@ def process_ingest_job(job_id: UUID) -> None:
 
             try:
                 # 1) Download file bytes from Supabase Storage
-                # Your helper should accept bucket/path. If your helper signature differs,
-                # adjust only this call.
-                file_bytes = download_from_supabase_storage(
-                    bucket=None,  # many implementations default internally; change if needed
-                    path=item.storage_path,
-                )
+                file_bytes = download_from_supabase_storage(bucket=bucket, path=item.storage_path)
 
                 # 2) Extract text based on file extension
                 path_lower = (item.storage_path or "").lower()
@@ -156,17 +160,21 @@ def process_ingest_job(job_id: UUID) -> None:
                 elif path_lower.endswith(".xlsx"):
                     text_content = extract_text_from_xlsx_bytes(file_bytes)
                 else:
-                    # Default: treat as text
+                    # Default: treat as utf-8 text
                     text_content = file_bytes.decode("utf-8", errors="ignore")
 
-                # 3) Ingest text (your existing chunk/embed/dedupe logic)
-                # Adjust argument names if your helper uses different names.
+                # 3) Ingest text using your existing ingestion engine
                 ingest_document_text(
-                    tenant_id=job.tenant_id,
-                    workspace_id=job.workspace_id,
-                    text=text_content,
-                    source_path=item.storage_path,
+                    db=db,
+                    tenant_id=str(job.tenant_id),
+                    workspace_id=str(job.workspace_id),
                     original_filename=item.original_filename,
+                    content=text_content,
+                    metadata={
+                        "storage_path": item.storage_path,
+                        "ingest_job_id": str(job.id),
+                        "bucket": bucket,
+                    },
                 )
 
                 # 4) Mark item completed
@@ -181,11 +189,11 @@ def process_ingest_job(job_id: UUID) -> None:
                 db.commit()
 
             except Exception as e:
-                # Mark item failed for now; if attempts remain we re-queue it
+                # Record error
                 item.error = str(e)
                 item.updated_at = datetime.utcnow()
 
-                # Re-queue if we still have attempts left
+                # Re-queue if attempts remain, else fail and count it
                 if item.attempts < max_attempts:
                     item.status = "queued"
                 else:
@@ -207,7 +215,7 @@ def process_ingest_job(job_id: UUID) -> None:
         if remaining:
             job.status = "processing"
         else:
-            # simple rule: any failures => failed, otherwise completed
+            # Simple rule: any failures => failed, otherwise completed
             if (job.failed_files or 0) > 0:
                 job.status = "failed"
             else:
@@ -226,6 +234,7 @@ def process_ingest_job(job_id: UUID) -> None:
         except Exception:
             pass
 
+
 # ----------------------------
 # Step 1: Create job (FAST) + kick off ingestion
 # ----------------------------
@@ -240,7 +249,7 @@ def create_ingest_job(
     background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
 ):
-    # Validate workspace exists and belongs to tenant (uses your existing tables)
+    # Validate workspace exists and belongs to tenant
     ws = db.execute(
         text("""
             SELECT id, tenant_id
@@ -295,6 +304,7 @@ def create_ingest_job(
     background_tasks.add_task(process_ingest_job, job.id)
 
     return IngestJobCreateOut(job_id=job.id, total_files=job.total_files, status=job.status)
+
 
 # ----------------------------
 # Step 2: Get job status (polling)
