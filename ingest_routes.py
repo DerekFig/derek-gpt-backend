@@ -5,7 +5,7 @@ from sqlalchemy import select
 from uuid import UUID
 
 from schemas_ingest import IngestJobOut, IngestJobItemOut
-from models import IngestJob, IngestJobItem  # adjust import if your models live elsewhere
+from main import IngestJob, IngestJobItem
 from db import get_db  # adjust import to your SessionLocal dependency
 from security import require_internal_key  # adjust to your X-Internal-Key dependency
 
