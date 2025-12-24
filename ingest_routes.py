@@ -58,7 +58,14 @@ def process_ingest_job(job_id: UUID) -> None:
                 # If ingest_document_text expects a db session, keep db=db.
                 # If not, remove db=db.
                 ingest_document_text(
-                    db=db,
-                    tenant_id=str(job.tenant_id),
-                    workspace_id=str(job.workspace_id),
-                    original_filename=item.original_filename,
+    db=db,
+    tenant_id=str(job.tenant_id),
+    workspace_id=str(job.workspace_id),
+    original_filename=item.original_filename,
+    content=content,
+    metadata={
+        "storage_path": item.storage_path,
+        "ingest_job_id": str(job.id),
+        "bucket": bucket,
+    },
+)
