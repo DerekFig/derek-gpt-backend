@@ -1040,19 +1040,20 @@ def query_embeddings(
     query_embedding = embed_text(payload.query)
     query_vec = embedding_to_pgvector_literal(query_embedding)
 
-    sql = text("""
+    sql = text(f"""
         SELECT
             e.document_id,
             e.chunk_index,
             e.chunk_text,
-            1 - (e.embedding <=> CAST(:query_embedding AS vector(1024))) AS score,
+            1 - (e.embedding <=> CAST(:query_embedding AS vector({EMBEDDING_DIM}))) AS score,
             d.original_filename,
             d.source_type
         FROM embeddings e
         JOIN documents d ON d.id = e.document_id
         WHERE e.tenant_id = :tenant_id
           AND e.workspace_id = :workspace_id
-        ORDER BY e.embedding <=> CAST(:query_embedding AS vector(1024))
+          AND e.embedding_model = :embedding_model
+        ORDER BY score DESC
         LIMIT :top_k;
     """)
 
@@ -1061,6 +1062,7 @@ def query_embeddings(
         {
             "tenant_id": payload.tenant_id,
             "workspace_id": payload.workspace_id,
+            "embedding_model": EMBEDDING_MODEL,
             "query_embedding": query_vec,
             "top_k": payload.top_k,
         },
@@ -1288,16 +1290,17 @@ def chat_with_workspace(
     query_embedding = embed_text(payload.query)
     query_vec = embedding_to_pgvector_literal(query_embedding)
 
-    sql = text("""
+    sql = text(f"""
         SELECT
             document_id,
             chunk_index,
             chunk_text,
-            1 - (embedding <=> CAST(:query_embedding AS vector(1024))) AS score
+            1 - (embedding <=> CAST(:query_embedding AS vector({EMBEDDING_DIM}))) AS score
         FROM embeddings
         WHERE tenant_id = :tenant_id
           AND workspace_id = :workspace_id
-        ORDER BY embedding <=> CAST(:query_embedding AS vector(1024))
+          AND embedding_model = :embedding_model
+        ORDER BY score DESC
         LIMIT :top_k;
     """)
 
@@ -1306,6 +1309,7 @@ def chat_with_workspace(
         {
             "tenant_id": payload.tenant_id,
             "workspace_id": payload.workspace_id,
+            "embedding_model": EMBEDDING_MODEL,
             "query_embedding": query_vec,
             "top_k": payload.top_k,
         },
@@ -1387,16 +1391,17 @@ def chat_with_workspace_stream(
     query_embedding = embed_text(payload.query)
     query_vec = embedding_to_pgvector_literal(query_embedding)
 
-    sql = text("""
+    sql = text(f"""
         SELECT
             document_id,
             chunk_index,
             chunk_text,
-            1 - (embedding <=> CAST(:query_embedding AS vector(1024))) AS score
+            1 - (embedding <=> CAST(:query_embedding AS vector({EMBEDDING_DIM}))) AS score
         FROM embeddings
         WHERE tenant_id = :tenant_id
           AND workspace_id = :workspace_id
-        ORDER BY embedding <=> CAST(:query_embedding AS vector(1024))
+          AND embedding_model = :embedding_model
+        ORDER BY score DESC
         LIMIT :top_k;
     """)
 
@@ -1405,6 +1410,7 @@ def chat_with_workspace_stream(
         {
             "tenant_id": payload.tenant_id,
             "workspace_id": payload.workspace_id,
+            "embedding_model": EMBEDDING_MODEL,
             "query_embedding": query_vec,
             "top_k": payload.top_k,
         },
