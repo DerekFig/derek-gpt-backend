@@ -90,6 +90,8 @@ def process_ingest_job(job_id: str) -> None:
                 # Compute hash from actual bytes
                 file_hash = sha256_bytes(file_bytes)
 
+                print(f"[INGEST] job={job_id} file={filename} hash={file_hash} bytes={len(file_bytes)}", flush=True)
+                
                 # --- DEBUG (1): persist evidence on the ingest job item itself (safe, small) ---
                 # If your IngestJobItem table has a metadata/json field you can store this there.
                 # If it doesn't, skip this block. We keep it defensive.
