@@ -69,6 +69,10 @@ class IngestJobOut(BaseModel):
     updated_at: datetime
     items: list[IngestJobItemOut]
 
+class KickPendingOut(BaseModel):
+    jobs_kicked: int
+    job_ids: list[UUID]
+
 # ----------------------------
 # Background processor
 # ----------------------------
@@ -81,9 +85,6 @@ def _sanitize_text_for_db(text_in: str) -> str:
     return (text_in or "").replace("\x00", "")
 
 def process_ingest_job(job_id: UUID) -> None:
-    # Stamp to confirm the correct processor is running
-    print("[STAMP] ingest_routes.process_ingest_job is running", flush=True)
-
     db: Session = SessionLocal()
     try:
         job = db.execute(select(IngestJob).where(IngestJob.id == job_id)).scalars().first()
@@ -128,7 +129,7 @@ def process_ingest_job(job_id: UUID) -> None:
             try:
                 file_bytes = download_from_supabase_storage(bucket=bucket, path=item.storage_path)
 
-                # Compute hash from raw bytes (source of truth)
+                # compute hash from raw bytes before extraction
                 file_hash = sha256_bytes(file_bytes)
                 print(
                     f"[truth] computed sha256={file_hash} len_bytes={len(file_bytes)} filename={item.original_filename}",
@@ -137,26 +138,6 @@ def process_ingest_job(job_id: UUID) -> None:
 
                 path_lower = (item.storage_path or "").lower()
 
-                # -------------------------------------------------
-                # Option 1: Reject legacy binary Office formats
-                # -------------------------------------------------
-                if path_lower.endswith(".doc") and not path_lower.endswith(".docx"):
-                    raise ValueError(
-                        "Unsupported legacy Word format (.doc). "
-                        "Please open the file in Microsoft Word (or Google Docs) and save it as .docx, "
-                        "then upload again."
-                    )
-
-                if path_lower.endswith(".xls") and not path_lower.endswith(".xlsx"):
-                    raise ValueError(
-                        "Unsupported legacy Excel format (.xls). "
-                        "Please open the file in Microsoft Excel (or Google Sheets) and save it as .xlsx, "
-                        "then upload again."
-                    )
-
-                # -------------------------------------------------
-                # Extract text for supported formats
-                # -------------------------------------------------
                 if path_lower.endswith(".pdf"):
                     content = extract_text_from_pdf_bytes_with_ocr(file_bytes)
 
@@ -175,8 +156,7 @@ def process_ingest_job(job_id: UUID) -> None:
                 else:
                     raise ValueError(
                         f"Unsupported file type for storage_path '{item.storage_path}'. "
-                        "Supported: .pdf, .pptx, .xlsx, .docx, .txt, .md "
-                        "(Legacy .doc/.xls not supported. Convert to .docx/.xlsx.)"
+                        "Supported: .pdf, .pptx, .xlsx, .docx, .txt, .md"
                     )
 
                 content = _sanitize_text_for_db(content)
@@ -208,7 +188,6 @@ def process_ingest_job(job_id: UUID) -> None:
                 item.error = str(e)
                 item.updated_at = datetime.utcnow()
 
-                # Retry logic: if still attempts left, re-queue. Otherwise mark failed.
                 if item.attempts < max_attempts:
                     item.status = "queued"
                 else:
@@ -293,9 +272,67 @@ def create_ingest_job(
     db.add_all(items)
     db.commit()
 
+    # kicks only THIS job; older jobs remain queued unless you kick them explicitly
     background_tasks.add_task(process_ingest_job, job.id)
 
     return IngestJobCreateOut(job_id=job.id, total_files=job.total_files, status=job.status)
+
+# ----------------------------
+# POST /ingest-jobs/kick-pending (manual re-kick)
+# ----------------------------
+
+@router.post(
+    "/ingest-jobs/kick-pending",
+    response_model=KickPendingOut,
+    dependencies=[Depends(verify_internal_key)],
+)
+def kick_pending_ingest_jobs(
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+    max_jobs: int = Query(25, ge=1, le=500),
+):
+    """
+    Finds ingest jobs that still have queued items and re-enqueues processing
+    via FastAPI BackgroundTasks.
+
+    This is a pragmatic workaround until you add a real worker loop.
+    """
+    job_ids = (
+        db.execute(
+            select(IngestJobItem.job_id)
+            .where(IngestJobItem.status == "queued")
+            .distinct()
+            .limit(max_jobs)
+        )
+        .scalars()
+        .all()
+    )
+
+    for jid in job_ids:
+        background_tasks.add_task(process_ingest_job, jid)
+
+    return KickPendingOut(jobs_kicked=len(job_ids), job_ids=job_ids)
+
+# ----------------------------
+# POST /ingest-jobs/{job_id}/kick (manual re-kick single job)
+# ----------------------------
+
+@router.post(
+    "/ingest-jobs/{job_id}/kick",
+    response_model=KickPendingOut,
+    dependencies=[Depends(verify_internal_key)],
+)
+def kick_one_ingest_job(
+    job_id: UUID,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+):
+    job = db.execute(select(IngestJob).where(IngestJob.id == job_id)).scalars().first()
+    if not job:
+        raise HTTPException(status_code=404, detail="Ingest job not found")
+
+    background_tasks.add_task(process_ingest_job, job_id)
+    return KickPendingOut(jobs_kicked=1, job_ids=[job_id])
 
 # ----------------------------
 # GET /ingest-jobs/{job_id}
