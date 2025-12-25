@@ -107,7 +107,7 @@ def process_ingest_job(job_id: UUID) -> None:
             if item.status in ("completed", "failed"):
                 continue
 
-            max_attempts = item.max_attempts or 3
+            max_attempts = item.max_attempts or 10
             attempts = item.attempts or 0
 
             if attempts >= max_attempts:
