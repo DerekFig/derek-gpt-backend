@@ -265,6 +265,8 @@ def embedding_to_pgvector_literal(embedding: list[float]) -> str:
         return "[]"
     return "[" + ",".join(str(float(x)) for x in embedding) + "]"
 
+import logging
+logger = logging.getLogger(__name__)
 
 def ingest_document_text(
     db: Session,
@@ -274,20 +276,9 @@ def ingest_document_text(
     content: str,
     metadata: Optional[dict] = None,
     *,
-       
-    import logging
-logger = logging.getLogger(__name__)
-
-if file_hash is None:
-    logger.error("ingest_document_text called with file_hash=None for %s", original_filename)
-else:
-    logger.info("ingest_document_text file_hash=%s filename=%s", file_hash, original_filename)
-
     document_id: Optional[str] = None,
     file_hash: Optional[str] = None,
 ):
-
-print(f"[truth] ingest_document_text file_hash={file_hash} filename={original_filename}", flush=True)
     """
     Ingests a document into `documents` and its chunks into `embeddings`.
 
@@ -300,6 +291,14 @@ print(f"[truth] ingest_document_text file_hash={file_hash} filename={original_fi
         this function will SKIP creating a new documents row and SKIP embeddings.
     """
     metadata = metadata or {}
+
+    # truth/debug (safe)
+    if file_hash is None:
+        logger.error("ingest_document_text called with file_hash=None for %s", original_filename)
+    else:
+        logger.info("ingest_document_text file_hash=%s filename=%s", file_hash, original_filename)
+
+    # (keep the rest of your existing ingest_document_text code below)
 
     source_type = metadata.get("source_type")
     if not source_type:
