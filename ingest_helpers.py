@@ -274,6 +274,8 @@ def ingest_document_text(
     content: str,
     metadata: Optional[dict] = None,
     *,
+
+    print(f"[truth] ingest_document_text file_hash={file_hash} filename={original_filename}", flush=True)
     
     import logging
 logger = logging.getLogger(__name__)
