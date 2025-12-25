@@ -274,9 +274,7 @@ def ingest_document_text(
     content: str,
     metadata: Optional[dict] = None,
     *,
-
-    print(f"[truth] ingest_document_text file_hash={file_hash} filename={original_filename}", flush=True)
-    
+       
     import logging
 logger = logging.getLogger(__name__)
 
@@ -288,6 +286,8 @@ else:
     document_id: Optional[str] = None,
     file_hash: Optional[str] = None,
 ):
+
+print(f"[truth] ingest_document_text file_hash={file_hash} filename={original_filename}", flush=True)
     """
     Ingests a document into `documents` and its chunks into `embeddings`.
 
