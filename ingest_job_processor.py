@@ -97,6 +97,7 @@ def _safe_extract_text(filename: str, file_bytes: bytes) -> str:
 
 
 def process_ingest_job(job_id: str):
+    print("[STAMP] ingest_job_processor.process_ingest_job is running", flush=True)
     """
     Run ingestion for all items in a job:
       - download from Supabase Storage
