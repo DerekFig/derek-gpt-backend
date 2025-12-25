@@ -3,16 +3,17 @@ from __future__ import annotations
 
 from datetime import datetime
 import os
+from uuid import UUID
 
+from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from db import SessionLocal
 from models_ingest import IngestJob, IngestJobItem
 
-# Reuse existing helpers exactly as requested.
-# If these helpers are currently defined in main.py, import them from there.
-# If that causes circular imports, move ONLY the helper functions to a pure module
-# (e.g., ingest_helpers.py) and import from that module instead.
+# IMPORTANT:
+# Keep using your existing helpers, but we also need sha256_bytes for file_hash.
+# If you truly must import from main, keep it. Otherwise, ingest_helpers is cleaner.
 from main import (
     download_from_supabase_storage,
     ingest_document_text,
@@ -21,7 +22,9 @@ from main import (
     extract_text_from_xlsx_bytes,
 )
 
-# Optional: bucket default if not stored per-item
+# This is required to compute file_hash from bytes
+from ingest_helpers import sha256_bytes
+
 DEFAULT_BUCKET = os.getenv("SUPABASE_STORAGE_BUCKET", "documents")
 
 
@@ -38,13 +41,41 @@ def _set_job_counts(db: Session, job: IngestJob):
         IngestJobItem.job_id == job.id, IngestJobItem.status == "failed"
     ).count()
 
-    # Only set these if your model/table has them. If not, remove these lines.
     if hasattr(job, "total_items"):
         job.total_items = total
     if hasattr(job, "completed_items"):
         job.completed_items = completed
     if hasattr(job, "failed_items"):
         job.failed_items = failed
+
+
+def _find_existing_document_id(db: Session, workspace_id: str, file_hash: str) -> str | None:
+    """
+    Returns an existing documents.id if a doc in this workspace already has the same file_hash.
+    This enables strict dedupe by replacing instead of creating a new row.
+    """
+    if not file_hash:
+        return None
+
+    row = db.execute(
+        text(
+            """
+            SELECT id
+            FROM documents
+            WHERE workspace_id = :workspace_id
+              AND file_hash = :file_hash
+            LIMIT 1;
+            """
+        ),
+        {"workspace_id": UUID(workspace_id), "file_hash": file_hash},
+    ).fetchone()
+
+    if not row:
+        return None
+
+    # row may be tuple-like or have attribute access depending on driver
+    existing_id = getattr(row, "id", None) or row[0]
+    return str(existing_id)
 
 
 def process_ingest_job(job_id: str) -> None:
@@ -63,7 +94,11 @@ def process_ingest_job(job_id: str) -> None:
         items = (
             db.query(IngestJobItem)
             .filter(IngestJobItem.job_id == job_id)
-            .order_by(IngestJobItem.created_at.asc() if hasattr(IngestJobItem, "created_at") else IngestJobItem.id.asc())
+            .order_by(
+                IngestJobItem.created_at.asc()
+                if hasattr(IngestJobItem, "created_at")
+                else IngestJobItem.id.asc()
+            )
             .all()
         )
 
@@ -78,29 +113,55 @@ def process_ingest_job(job_id: str) -> None:
 
                 bucket = getattr(item, "bucket", None) or DEFAULT_BUCKET
                 storage_path = item.storage_path
-                filename = item.filename or storage_path.split("/")[-1]
 
+                # Be robust to naming differences in your model
+                original_filename = (
+                    getattr(item, "original_filename", None)
+                    or getattr(item, "filename", None)
+                    or storage_path.split("/")[-1]
+                )
+
+                # 1) Download bytes
                 file_bytes = download_from_supabase_storage(bucket, storage_path)
 
-                name = filename.lower()
-                if name.endswith(".pdf"):
-                    text = extract_text_from_pdf_bytes_with_ocr(file_bytes)
-                elif name.endswith(".pptx"):
-                    text = extract_text_from_pptx_bytes(file_bytes)
-                elif name.endswith(".xlsx"):
-                    text = extract_text_from_xlsx_bytes(file_bytes)
-                else:
-                    # If you already support more formats elsewhere, call that existing helper here.
-                    # This fallback is intentionally conservative.
-                    text = file_bytes.decode("utf-8", errors="ignore")
+                # 2) Compute file_hash from raw bytes (this is the dedupe key)
+                file_hash = sha256_bytes(file_bytes)
 
-                # This is the core: reuse your existing ingestion pipeline.
-                # Make sure these argument names match your ingest_document_text signature.
+                # 3) Extract text
+                name = (original_filename or "").lower()
+                if name.endswith(".pdf"):
+                    content = extract_text_from_pdf_bytes_with_ocr(file_bytes)
+                elif name.endswith(".pptx"):
+                    content = extract_text_from_pptx_bytes(file_bytes)
+                elif name.endswith(".xlsx"):
+                    content = extract_text_from_xlsx_bytes(file_bytes)
+                else:
+                    # Conservative fallback; you can expand later
+                    content = file_bytes.decode("utf-8", errors="ignore")
+
+                # Optional: pass through metadata if you store it on the item/job
+                metadata = getattr(item, "metadata", None) or getattr(job, "metadata", None) or None
+
+                # 4) Strict dedupe: if same hash already exists in workspace, REPLACE it
+                # (no duplicate rows, no extra embeddings)
+                existing_document_id = _find_existing_document_id(
+                    db=db,
+                    workspace_id=str(item.workspace_id),
+                    file_hash=file_hash,
+                )
+
+                # 5) Ingest using the correct signature + pass file_hash
+                # IMPORTANT: your ingest_helpers.py expects:
+                # ingest_document_text(db, tenant_id, workspace_id, original_filename, content, ...)
                 ingest_document_text(
-                    tenant_id=item.tenant_id,
-                    workspace_id=item.workspace_id,
-                    filename=filename,
-                    text=text,
+                    db=db,
+                    tenant_id=str(item.tenant_id),
+                    workspace_id=str(item.workspace_id),
+                    original_filename=original_filename,
+                    content=content,
+                    metadata=metadata,
+                    document_id=existing_document_id,  # replace if dup exists
+                    file_hash=file_hash,
                 )
 
                 item.status = "completed"
@@ -125,9 +186,12 @@ def process_ingest_job(job_id: str) -> None:
         # Finalize job
         _set_job_counts(db, job)
 
-        any_failed = db.query(IngestJobItem).filter(
-            IngestJobItem.job_id == job.id, IngestJobItem.status == "failed"
-        ).count() > 0
+        any_failed = (
+            db.query(IngestJobItem)
+            .filter(IngestJobItem.job_id == job.id, IngestJobItem.status == "failed")
+            .count()
+            > 0
+        )
 
         job.status = "completed_with_errors" if any_failed else "completed"
         if hasattr(job, "completed_at"):
