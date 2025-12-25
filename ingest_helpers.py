@@ -343,7 +343,8 @@ def ingest_document_text(
         # If file_hash is missing, we cannot dedupe. We still insert.
         # (Best practice is to compute from raw bytes upstream and pass it in.)
         if file_hash:
-            # Try insert; if duplicate, DO NOTHING and RETURNING yields no row.
+            # IMPORTANT: Because the recommended unique index is PARTIAL (WHERE file_hash IS NOT NULL),
+            # the ON CONFLICT target must include the same predicate so Postgres can infer it.
             result = db.execute(
                 text("""
                     INSERT INTO documents (
@@ -364,7 +365,8 @@ def ingest_document_text(
                         :primary_embedding_model,
                         :file_hash
                     )
-                    ON CONFLICT (workspace_id, file_hash) DO NOTHING
+                    ON CONFLICT (workspace_id, file_hash) WHERE file_hash IS NOT NULL
+                    DO NOTHING
                     RETURNING id;
                 """),
                 {
@@ -393,9 +395,6 @@ def ingest_document_text(
                 ).fetchone()
 
                 existing_id = str(existing.id) if existing else None
-
-                # Clear transaction state (defensive)
-                db.rollback()
 
                 return {
                     "document_id": existing_id,
