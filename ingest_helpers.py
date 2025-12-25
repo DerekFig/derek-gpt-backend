@@ -10,6 +10,7 @@ import os
 from io import BytesIO
 from typing import Optional, List
 from uuid import UUID
+import logging
 
 import fitz  # PyMuPDF
 import requests
@@ -265,8 +266,9 @@ def embedding_to_pgvector_literal(embedding: list[float]) -> str:
         return "[]"
     return "[" + ",".join(str(float(x)) for x in embedding) + "]"
 
-import logging
+
 logger = logging.getLogger(__name__)
+
 
 def ingest_document_text(
     db: Session,
@@ -298,7 +300,17 @@ def ingest_document_text(
     else:
         logger.info("ingest_document_text file_hash=%s filename=%s", file_hash, original_filename)
 
-    # (keep the rest of your existing ingest_document_text code below)
+    # ----------------------------
+    # FIX: normalize file_hash so empty/whitespace never routes to NULL insert accidentally
+    # ----------------------------
+    if isinstance(file_hash, str):
+        file_hash = file_hash.strip()
+        if file_hash == "":
+            file_hash = None
+
+    # Optional sanity logging (does not change behavior)
+    if file_hash is not None and isinstance(file_hash, str) and len(file_hash) != 64:
+        logger.error("Unexpected file_hash length (expected 64). filename=%s file_hash=%r", original_filename, file_hash)
 
     source_type = metadata.get("source_type")
     if not source_type:
@@ -352,7 +364,7 @@ def ingest_document_text(
     else:
         # If file_hash is missing, we cannot dedupe. We still insert.
         # (Best practice is to compute from raw bytes upstream and pass it in.)
-        if file_hash:
+        if file_hash is not None:
             # IMPORTANT: Because the recommended unique index is PARTIAL (WHERE file_hash IS NOT NULL),
             # the ON CONFLICT target must include the same predicate so Postgres can infer it.
             result = db.execute(
@@ -448,11 +460,34 @@ def ingest_document_text(
                     "metadata": json.dumps(metadata) if metadata else None,
                     "source_type": source_type,
                     "primary_embedding_model": EMBEDDING_MODEL,
-                    "file_hash": None,
+                    "file_hash": file_hash,
                 },
             )
             doc_row = result.fetchone()
             document_id = str(doc_row.id)
+
+    # ----------------------------
+    # DEBUG: read back what DB currently has for file_hash (within same transaction)
+    # ----------------------------
+    try:
+        row = db.execute(
+            text("""
+                SELECT file_hash
+                FROM documents
+                WHERE id = :document_id
+                  AND workspace_id = :workspace_id
+                LIMIT 1;
+            """),
+            {"document_id": UUID(document_id), "workspace_id": UUID(workspace_id)},
+        ).fetchone()
+        logger.warning(
+            "DEBUG DB file_hash readback (pre-commit): doc_id=%s file_hash_db=%r file_hash_arg=%r",
+            document_id,
+            (row[0] if row else None),
+            file_hash,
+        )
+    except Exception as e:
+        logger.exception("DEBUG failed to read back file_hash pre-commit: %s", repr(e))
 
     # ----------------------------
     # Embeddings insert (tenant_id is still required by embeddings table schema)
@@ -497,6 +532,27 @@ def ingest_document_text(
         )
 
     db.commit()
+
+    # Optional: confirm after commit too (more definitive if you suspect later wipes)
+    try:
+        row2 = db.execute(
+            text("""
+                SELECT file_hash
+                FROM documents
+                WHERE id = :document_id
+                  AND workspace_id = :workspace_id
+                LIMIT 1;
+            """),
+            {"document_id": UUID(document_id), "workspace_id": UUID(workspace_id)},
+        ).fetchone()
+        logger.warning(
+            "DEBUG DB file_hash readback (post-commit): doc_id=%s file_hash_db=%r file_hash_arg=%r",
+            document_id,
+            (row2[0] if row2 else None),
+            file_hash,
+        )
+    except Exception as e:
+        logger.exception("DEBUG failed to read back file_hash post-commit: %s", repr(e))
 
     return {
         "document_id": str(document_id),
