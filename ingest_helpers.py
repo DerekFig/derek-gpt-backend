@@ -274,6 +274,15 @@ def ingest_document_text(
     content: str,
     metadata: Optional[dict] = None,
     *,
+    
+    import logging
+logger = logging.getLogger(__name__)
+
+if file_hash is None:
+    logger.error("ingest_document_text called with file_hash=None for %s", original_filename)
+else:
+    logger.info("ingest_document_text file_hash=%s filename=%s", file_hash, original_filename)
+
     document_id: Optional[str] = None,
     file_hash: Optional[str] = None,
 ):
