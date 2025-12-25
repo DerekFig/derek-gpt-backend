@@ -4,6 +4,7 @@ from __future__ import annotations
 from datetime import datetime
 import os
 
+from uuid import UUID
 from sqlalchemy.orm import Session
 from sqlalchemy import text
 
@@ -17,10 +18,14 @@ from ingest_helpers import (
     extract_text_from_pdf_bytes_with_ocr,
     extract_text_from_pptx_bytes,
     extract_text_from_xlsx_bytes,
+    extract_text_from_docx_bytes,
     sha256_bytes,
+    SUPABASE_STORAGE_BUCKET,
 )
 
-DEFAULT_BUCKET = os.getenv("SUPABASE_STORAGE_BUCKET", "documents")
+# --------------------------------------------------------
+# Background processor entrypoint
+# --------------------------------------------------------
 
 
 def _utcnow():
@@ -44,80 +49,119 @@ def _set_job_counts(db: Session, job: IngestJob):
         job.failed_items = failed
 
 
-def process_ingest_job(job_id: str) -> None:
+def _mark_job_done(db: Session, job: IngestJob, status: str):
+    job.status = status
+    job.completed_at = _utcnow()
+    _set_job_counts(db, job)
+    db.commit()
+
+
+def _mark_item(db: Session, item: IngestJobItem, status: str, *, error: str | None = None, result: dict | None = None):
+    item.status = status
+    item.updated_at = _utcnow()
+    if hasattr(item, "error"):
+        item.error = error
+    if hasattr(item, "result"):
+        item.result = result
+    db.commit()
+
+
+def _safe_extract_text(filename: str, file_bytes: bytes) -> str:
+    lower_name = (filename or "").lower()
+
+    # PDF: try OCR path you’ve built (vision-based OCR on rendered pages)
+    if lower_name.endswith(".pdf"):
+        return extract_text_from_pdf_bytes_with_ocr(file_bytes)
+
+    # PPTX
+    if lower_name.endswith(".pptx"):
+        return extract_text_from_pptx_bytes(file_bytes)
+
+    # XLSX
+    if lower_name.endswith(".xlsx"):
+        return extract_text_from_xlsx_bytes(file_bytes)
+
+    # DOCX
+    if lower_name.endswith(".docx"):
+        return extract_text_from_docx_bytes(file_bytes)
+
+    # Plain text fallback
+    if lower_name.endswith(".txt") or lower_name.endswith(".md"):
+        try:
+            return file_bytes.decode("utf-8", errors="ignore")
+        except Exception:
+            return ""
+
+    # If unsupported, return empty (caller will treat as failure)
+    return ""
+
+
+def process_ingest_job(job_id: str):
+    """
+    Run ingestion for all items in a job:
+      - download from Supabase Storage
+      - compute sha256(file_bytes)
+      - extract text
+      - call ingest_document_text (documents + chunks/embeddings)
+    """
     db = SessionLocal()
     try:
-        job = db.query(IngestJob).filter(IngestJob.id == job_id).one()
+        job = db.query(IngestJob).filter(IngestJob.id == job_id).first()
+        if not job:
+            print(f"[INGEST] job not found: {job_id}", flush=True)
+            return
+
+        if job.status not in ("queued", "running"):
+            print(f"[INGEST] job status is {job.status}; not processing: {job_id}", flush=True)
+            return
 
         job.status = "running"
-        if hasattr(job, "started_at"):
-            job.started_at = _utcnow()
-        if hasattr(job, "updated_at"):
-            job.updated_at = _utcnow()
+        job.started_at = _utcnow()
         db.commit()
 
         items = (
             db.query(IngestJobItem)
             .filter(IngestJobItem.job_id == job_id)
-            .order_by(
-                IngestJobItem.created_at.asc()
-                if hasattr(IngestJobItem, "created_at")
-                else IngestJobItem.id.asc()
-            )
+            .order_by(IngestJobItem.created_at.asc())
             .all()
         )
 
+        print(f"[INGEST] job={job_id} items={len(items)}", flush=True)
+
         for item in items:
+            # Skip already completed
+            if item.status == "completed":
+                continue
+
             try:
-                item.status = "running"
-                if hasattr(item, "started_at"):
-                    item.started_at = _utcnow()
-                if hasattr(item, "updated_at"):
-                    item.updated_at = _utcnow()
-                db.commit()
+                bucket = getattr(item, "storage_bucket", None) or SUPABASE_STORAGE_BUCKET
+                path = getattr(item, "storage_path", None) or getattr(item, "storage_key", None)
+                filename = getattr(item, "original_filename", None) or getattr(item, "filename", None) or "unnamed"
 
-                bucket = getattr(item, "bucket", None) or DEFAULT_BUCKET
-                storage_path = item.storage_path
+                if not path:
+                    raise RuntimeError("Missing storage_path on ingest item")
 
-                filename = (
-                    getattr(item, "original_filename", None)
-                    or getattr(item, "filename", None)
-                    or storage_path.split("/")[-1]
+                print(f"[INGEST] downloading: bucket={bucket} path={path} filename={filename}", flush=True)
+                file_bytes = download_from_supabase_storage(bucket, path)
+
+                # --- DEBUG (truth): compute hash from raw bytes ---
+                file_hash = sha256_bytes(file_bytes)
+                print(
+                    f"[truth] computed sha256={file_hash} len_bytes={len(file_bytes)} filename={filename}",
+                    flush=True,
                 )
 
-                file_bytes = download_from_supabase_storage(bucket, storage_path)
+                content_text = _safe_extract_text(filename, file_bytes)
+                if not content_text or not content_text.strip():
+                    raise RuntimeError("Text extraction returned empty content")
 
-                # Compute hash from actual bytes
-                file_hash = sha256_bytes(file_bytes)
-                print(f"[truth] computed sha256={file_hash} storage_path={storage_path}", flush=True)
+                metadata = getattr(item, "metadata", None) or {}
+                # Ensure provenance metadata has storage info if useful
+                if isinstance(metadata, dict):
+                    metadata.setdefault("storage_bucket", bucket)
+                    metadata.setdefault("storage_path", path)
 
-                print(f"[INGEST] job={job_id} file={filename} hash={file_hash} bytes={len(file_bytes)}", flush=True)
-                
-                # --- DEBUG (1): persist evidence on the ingest job item itself (safe, small) ---
-                # If your IngestJobItem table has a metadata/json field you can store this there.
-                # If it doesn't, skip this block. We keep it defensive.
-                if hasattr(item, "debug"):
-                    try:
-                        item.debug = f"hash={file_hash[:16]} size={len(file_bytes)}"
-                    except Exception:
-                        pass
-                db.commit()
-
-                name = (filename or "").lower()
-                if name.endswith(".pdf"):
-                    content_text = extract_text_from_pdf_bytes_with_ocr(file_bytes)
-                elif name.endswith(".pptx"):
-                    content_text = extract_text_from_pptx_bytes(file_bytes)
-                elif name.endswith(".xlsx"):
-                    content_text = extract_text_from_xlsx_bytes(file_bytes)
-                else:
-                    content_text = file_bytes.decode("utf-8", errors="ignore")
-
-                metadata = {
-                    "bucket": bucket,
-                    "storage_path": storage_path,
-                }
-
+                # --- IMPORTANT: pass file_hash into ingest_document_text ---
                 result = ingest_document_text(
                     db=db,
                     tenant_id=str(item.tenant_id),
@@ -128,10 +172,9 @@ def process_ingest_job(job_id: str) -> None:
                     file_hash=file_hash,
                 )
 
-                # --- CRITICAL SAFETY NET ---
-                # If ingest_document_text deduped or inserted but somehow file_hash didn’t persist,
-                # force it onto the documents row we ended up with.
                 document_id = result.get("document_id")
+
+                # --- SAFETY NET: ensure documents.file_hash is set even if helper path failed ---
                 if document_id:
                     db.execute(
                         text("""
@@ -142,8 +185,8 @@ def process_ingest_job(job_id: str) -> None:
                         """),
                         {
                             "file_hash": file_hash,
-                            "document_id": document_id,
-                            "workspace_id": str(item.workspace_id),
+                            "document_id": UUID(str(document_id)),
+                            "workspace_id": UUID(str(item.workspace_id)),
                         },
                     )
                     db.commit()
@@ -158,59 +201,28 @@ def process_ingest_job(job_id: str) -> None:
                               AND workspace_id = :workspace_id
                             LIMIT 1
                         """),
-                        {"document_id": document_id, "workspace_id": str(item.workspace_id)},
+                        {"document_id": UUID(str(document_id)), "workspace_id": UUID(str(item.workspace_id))},
                     ).fetchone()
                     db_hash = row[0] if row else None
-                    print(f"[ingest_job_processor] doc_id={document_id} computed_hash={file_hash} db_hash={db_hash}")
+                    print(
+                        f"[DEBUG] db readback: document_id={document_id} file_hash_db={db_hash} file_hash_computed={file_hash}",
+                        flush=True,
+                    )
 
-                item.status = "completed"
-                if hasattr(item, "completed_at"):
-                    item.completed_at = _utcnow()
-                if hasattr(item, "updated_at"):
-                    item.updated_at = _utcnow()
-                if hasattr(item, "error"):
-                    item.error = None
-                db.commit()
+                _mark_item(db, item, "completed", result=result)
 
             except Exception as e:
-                item.status = "failed"
-                if hasattr(item, "error"):
-                    item.error = str(e)[:2000]
-                if hasattr(item, "completed_at"):
-                    item.completed_at = _utcnow()
-                if hasattr(item, "updated_at"):
-                    item.updated_at = _utcnow()
-                db.commit()
+                print(f"[INGEST] item failed: id={item.id} err={repr(e)}", flush=True)
+                _mark_item(db, item, "failed", error=str(e))
 
+        # Final job status
         _set_job_counts(db, job)
+        if getattr(job, "failed_items", 0) and getattr(job, "failed_items", 0) > 0:
+            _mark_job_done(db, job, "completed_with_errors")
+        else:
+            _mark_job_done(db, job, "completed")
 
-        any_failed = (
-            db.query(IngestJobItem)
-            .filter(IngestJobItem.job_id == job.id, IngestJobItem.status == "failed")
-            .count()
-            > 0
-        )
+        print(f"[INGEST] job complete: {job_id} status={job.status}", flush=True)
 
-        job.status = "completed_with_errors" if any_failed else "completed"
-        if hasattr(job, "completed_at"):
-            job.completed_at = _utcnow()
-        if hasattr(job, "updated_at"):
-            job.updated_at = _utcnow()
-        db.commit()
-
-    except Exception as e:
-        try:
-            job = db.query(IngestJob).filter(IngestJob.id == job_id).one()
-            job.status = "failed"
-            if hasattr(job, "error"):
-                job.error = str(e)[:2000]
-            if hasattr(job, "completed_at"):
-                job.completed_at = _utcnow()
-            if hasattr(job, "updated_at"):
-                job.updated_at = _utcnow()
-            db.commit()
-        except Exception:
-            pass
-        raise
     finally:
         db.close()
