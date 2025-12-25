@@ -277,6 +277,17 @@ def ingest_document_text(
     document_id: Optional[str] = None,
     file_hash: Optional[str] = None,
 ):
+    """
+    Ingests a document into `documents` and its chunks into `embeddings`.
+
+    DEDUPE BEHAVIOR (strict):
+      - Requires a UNIQUE index in Postgres:
+          create unique index if not exists documents_dedupe_idx
+          on documents (workspace_id, file_hash)
+          where file_hash is not null;
+      - If `document_id` is not provided and (workspace_id, file_hash) already exists,
+        this function will SKIP creating a new documents row and SKIP embeddings.
+    """
     metadata = metadata or {}
 
     source_type = metadata.get("source_type")
@@ -285,8 +296,12 @@ def ingest_document_text(
 
     replaced = False
 
+    # ----------------------------
+    # Replace existing (explicit id)
+    # ----------------------------
     if document_id:
         replaced = True
+
         db.execute(
             text("""
                 DELETE FROM embeddings
@@ -320,42 +335,119 @@ def ingest_document_text(
                 "file_hash": file_hash,
             },
         )
-    else:
-        result = db.execute(
-            text("""
-                INSERT INTO documents (
-                    workspace_id,
-                    original_filename,
-                    content_text,
-                    metadata,
-                    source_type,
-                    primary_embedding_model,
-                    file_hash
-                )
-                VALUES (
-                    :workspace_id,
-                    :original_filename,
-                    :content_text,
-                    :metadata,
-                    :source_type,
-                    :primary_embedding_model,
-                    :file_hash
-                )
-                RETURNING id;
-            """),
-            {
-                "workspace_id": UUID(workspace_id),
-                "original_filename": original_filename,
-                "content_text": content,
-                "metadata": json.dumps(metadata) if metadata else None,
-                "source_type": source_type,
-                "primary_embedding_model": EMBEDDING_MODEL,
-                "file_hash": file_hash,
-            },
-        )
-        doc_row = result.fetchone()
-        document_id = str(doc_row.id)
 
+    # ----------------------------
+    # Insert new with dedupe
+    # ----------------------------
+    else:
+        # If file_hash is missing, we cannot dedupe. We still insert.
+        # (Best practice is to compute from raw bytes upstream and pass it in.)
+        if file_hash:
+            # Try insert; if duplicate, DO NOTHING and RETURNING yields no row.
+            result = db.execute(
+                text("""
+                    INSERT INTO documents (
+                        workspace_id,
+                        original_filename,
+                        content_text,
+                        metadata,
+                        source_type,
+                        primary_embedding_model,
+                        file_hash
+                    )
+                    VALUES (
+                        :workspace_id,
+                        :original_filename,
+                        :content_text,
+                        :metadata,
+                        :source_type,
+                        :primary_embedding_model,
+                        :file_hash
+                    )
+                    ON CONFLICT (workspace_id, file_hash) DO NOTHING
+                    RETURNING id;
+                """),
+                {
+                    "workspace_id": UUID(workspace_id),
+                    "original_filename": original_filename,
+                    "content_text": content,
+                    "metadata": json.dumps(metadata) if metadata else None,
+                    "source_type": source_type,
+                    "primary_embedding_model": EMBEDDING_MODEL,
+                    "file_hash": file_hash,
+                },
+            )
+            doc_row = result.fetchone()
+
+            if doc_row is None:
+                # Duplicate: fetch existing id, skip embeddings.
+                existing = db.execute(
+                    text("""
+                        SELECT id
+                        FROM documents
+                        WHERE workspace_id = :workspace_id
+                          AND file_hash = :file_hash
+                        LIMIT 1;
+                    """),
+                    {"workspace_id": UUID(workspace_id), "file_hash": file_hash},
+                ).fetchone()
+
+                existing_id = str(existing.id) if existing else None
+
+                # Clear transaction state (defensive)
+                db.rollback()
+
+                return {
+                    "document_id": existing_id,
+                    "num_chunks": 0,
+                    "source_type": source_type,
+                    "replaced": False,
+                    "file_hash": file_hash,
+                    "deduped": True,
+                }
+
+            document_id = str(doc_row.id)
+
+        else:
+            # No hash, do a plain insert.
+            result = db.execute(
+                text("""
+                    INSERT INTO documents (
+                        workspace_id,
+                        original_filename,
+                        content_text,
+                        metadata,
+                        source_type,
+                        primary_embedding_model,
+                        file_hash
+                    )
+                    VALUES (
+                        :workspace_id,
+                        :original_filename,
+                        :content_text,
+                        :metadata,
+                        :source_type,
+                        :primary_embedding_model,
+                        :file_hash
+                    )
+                    RETURNING id;
+                """),
+                {
+                    "workspace_id": UUID(workspace_id),
+                    "original_filename": original_filename,
+                    "content_text": content,
+                    "metadata": json.dumps(metadata) if metadata else None,
+                    "source_type": source_type,
+                    "primary_embedding_model": EMBEDDING_MODEL,
+                    "file_hash": None,
+                },
+            )
+            doc_row = result.fetchone()
+            document_id = str(doc_row.id)
+
+    # ----------------------------
+    # Embeddings insert (tenant_id is still required by embeddings table schema)
+    # ----------------------------
     chunks = chunk_text(content)
 
     for idx, chunk in enumerate(chunks):
@@ -403,6 +495,7 @@ def ingest_document_text(
         "source_type": source_type,
         "replaced": replaced,
         "file_hash": file_hash,
+        "deduped": False,
     }
 
 
