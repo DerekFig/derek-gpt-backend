@@ -5,6 +5,7 @@ from datetime import datetime
 import os
 
 from sqlalchemy.orm import Session
+from sqlalchemy import text
 
 from db import SessionLocal
 from models_ingest import IngestJob, IngestJobItem
@@ -35,7 +36,6 @@ def _set_job_counts(db: Session, job: IngestJob):
         IngestJobItem.job_id == job.id, IngestJobItem.status == "failed"
     ).count()
 
-    # Only set if present on your model
     if hasattr(job, "total_items"):
         job.total_items = total
     if hasattr(job, "completed_items"):
@@ -79,7 +79,6 @@ def process_ingest_job(job_id: str) -> None:
                 bucket = getattr(item, "bucket", None) or DEFAULT_BUCKET
                 storage_path = item.storage_path
 
-                # Some schemas use original_filename instead of filename
                 filename = (
                     getattr(item, "original_filename", None)
                     or getattr(item, "filename", None)
@@ -88,8 +87,18 @@ def process_ingest_job(job_id: str) -> None:
 
                 file_bytes = download_from_supabase_storage(bucket, storage_path)
 
-                # Compute the dedupe hash from the *actual bytes*
+                # Compute hash from actual bytes
                 file_hash = sha256_bytes(file_bytes)
+
+                # --- DEBUG (1): persist evidence on the ingest job item itself (safe, small) ---
+                # If your IngestJobItem table has a metadata/json field you can store this there.
+                # If it doesn't, skip this block. We keep it defensive.
+                if hasattr(item, "debug"):
+                    try:
+                        item.debug = f"hash={file_hash[:16]} size={len(file_bytes)}"
+                    except Exception:
+                        pass
+                db.commit()
 
                 name = (filename or "").lower()
                 if name.endswith(".pdf"):
@@ -101,14 +110,12 @@ def process_ingest_job(job_id: str) -> None:
                 else:
                     content_text = file_bytes.decode("utf-8", errors="ignore")
 
-                # Optional metadata you may want stored
                 metadata = {
                     "bucket": bucket,
                     "storage_path": storage_path,
                 }
 
-                # NOTE: this uses the ingest_helpers.ingest_document_text signature you pasted
-                ingest_document_text(
+                result = ingest_document_text(
                     db=db,
                     tenant_id=str(item.tenant_id),
                     workspace_id=str(item.workspace_id),
@@ -117,6 +124,41 @@ def process_ingest_job(job_id: str) -> None:
                     metadata=metadata,
                     file_hash=file_hash,
                 )
+
+                # --- CRITICAL SAFETY NET ---
+                # If ingest_document_text deduped or inserted but somehow file_hash didn’t persist,
+                # force it onto the documents row we ended up with.
+                document_id = result.get("document_id")
+                if document_id:
+                    db.execute(
+                        text("""
+                            UPDATE documents
+                            SET file_hash = :file_hash
+                            WHERE id = :document_id
+                              AND workspace_id = :workspace_id
+                        """),
+                        {
+                            "file_hash": file_hash,
+                            "document_id": document_id,
+                            "workspace_id": str(item.workspace_id),
+                        },
+                    )
+                    db.commit()
+
+                # --- DEBUG (2): confirm what the DB currently has for that doc_id ---
+                if document_id:
+                    row = db.execute(
+                        text("""
+                            SELECT file_hash
+                            FROM documents
+                            WHERE id = :document_id
+                              AND workspace_id = :workspace_id
+                            LIMIT 1
+                        """),
+                        {"document_id": document_id, "workspace_id": str(item.workspace_id)},
+                    ).fetchone()
+                    db_hash = row[0] if row else None
+                    print(f"[ingest_job_processor] doc_id={document_id} computed_hash={file_hash} db_hash={db_hash}")
 
                 item.status = "completed"
                 if hasattr(item, "completed_at"):
