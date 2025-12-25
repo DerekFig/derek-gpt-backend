@@ -137,20 +137,46 @@ def process_ingest_job(job_id: UUID) -> None:
 
                 path_lower = (item.storage_path or "").lower()
 
+                # -------------------------------------------------
+                # Option 1: Reject legacy binary Office formats
+                # -------------------------------------------------
+                if path_lower.endswith(".doc") and not path_lower.endswith(".docx"):
+                    raise ValueError(
+                        "Unsupported legacy Word format (.doc). "
+                        "Please open the file in Microsoft Word (or Google Docs) and save it as .docx, "
+                        "then upload again."
+                    )
+
+                if path_lower.endswith(".xls") and not path_lower.endswith(".xlsx"):
+                    raise ValueError(
+                        "Unsupported legacy Excel format (.xls). "
+                        "Please open the file in Microsoft Excel (or Google Sheets) and save it as .xlsx, "
+                        "then upload again."
+                    )
+
+                # -------------------------------------------------
+                # Extract text for supported formats
+                # -------------------------------------------------
                 if path_lower.endswith(".pdf"):
                     content = extract_text_from_pdf_bytes_with_ocr(file_bytes)
+
                 elif path_lower.endswith(".pptx"):
                     content = extract_text_from_pptx_bytes(file_bytes)
+
                 elif path_lower.endswith(".xlsx"):
                     content = extract_text_from_xlsx_bytes(file_bytes)
+
                 elif path_lower.endswith(".docx"):
                     content = extract_text_from_docx_bytes(file_bytes)
+
                 elif path_lower.endswith(".txt") or path_lower.endswith(".md"):
                     content = file_bytes.decode("utf-8", errors="ignore")
+
                 else:
                     raise ValueError(
                         f"Unsupported file type for storage_path '{item.storage_path}'. "
-                        "Supported: .pdf, .pptx, .xlsx, .docx, .txt, .md"
+                        "Supported: .pdf, .pptx, .xlsx, .docx, .txt, .md "
+                        "(Legacy .doc/.xls not supported. Convert to .docx/.xlsx.)"
                     )
 
                 content = _sanitize_text_for_db(content)
@@ -182,6 +208,7 @@ def process_ingest_job(job_id: UUID) -> None:
                 item.error = str(e)
                 item.updated_at = datetime.utcnow()
 
+                # Retry logic: if still attempts left, re-queue. Otherwise mark failed.
                 if item.attempts < max_attempts:
                     item.status = "queued"
                 else:
